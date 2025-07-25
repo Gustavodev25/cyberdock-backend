@@ -6,6 +6,48 @@ const router = express.Router();
 
 const CLIENT_ID = process.env.ML_CLIENT_ID || '8423050287338772';
 const CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'WWYgt9KH0HtZFH4YzD2yhrOLYHCUST9D';
+
+// Rota para buscar contas conectadas
+router.get('/accounts/:uid', async (req, res) => {
+  try {
+    const db = getDatabase();
+    const snapshot = await db.ref(`users/${req.params.uid}/mercadolivre`).once('value');
+    const accounts = snapshot.val() || {};
+    res.json(Object.values(accounts));
+  } catch (error) {
+    console.error('Erro ao buscar contas:', error);
+    res.status(500).json({ error: 'Erro ao buscar contas do Mercado Livre' });
+  }
+});
+
+// Rota para buscar vendas
+router.get('/sales/:userId', async (req, res) => {
+  try {
+    const db = getDatabase();
+    const accountSnapshot = await db.ref(`mercadolivre_accounts/${req.params.userId}`).once('value');
+    const account = accountSnapshot.val();
+    
+    if (!account || !account.access_token) {
+      return res.status(401).json({ error: 'Conta não encontrada ou token inválido' });
+    }
+
+    const response = await fetch(`https://api.mercadolibre.com/orders/search?seller=${req.params.userId}`, {
+      headers: {
+        'Authorization': `Bearer ${account.access_token}`
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Erro na API do Mercado Livre: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    res.json(data.results);
+  } catch (error) {
+    console.error('Erro ao buscar vendas:', error);
+    res.status(500).json({ error: 'Erro ao buscar vendas do Mercado Livre' });
+  }
+});
 const codeVerifiers = new Map();
 
 function base64urlEncode(str) {
