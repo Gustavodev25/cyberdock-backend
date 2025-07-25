@@ -6,7 +6,10 @@ const mercadoLivreRouter = require('./router/mercadolivre');
 const { startNgrok } = require('./ngrok');
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: ['https://cyberdock.com.br', 'http://localhost:5173'],
+  credentials: true
+}));
 app.use(bodyParser.json());
 
 app.use('/ml', mercadoLivreRouter);

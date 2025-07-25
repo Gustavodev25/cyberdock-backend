@@ -31,7 +31,7 @@ function getRedirectUri(req) {
 function getFrontendUrl(success = true) {
   const baseUrl = process.env.NODE_ENV === 'production'
     ? 'https://cyberdock.com.br/contas'
-    : 'http://localhost:8080/contas';
+    : 'http://localhost:5173/contas';
   const query = success
     ? 'success=Conta%20conectada%20com%20sucesso'
     : 'error=Erro%20na%20conex%C3%A3o%20com%20Mercado%20Livre';
