@@ -268,6 +268,13 @@ router.get('/vendas', async (req, res) => {
       headers: { 'Authorization': `Bearer ${accessToken}` }
     });
 
+    // CORREÇÃO: Se a resposta não for JSON, retorna erro JSON
+    const contentType = apiResponse.headers.get("content-type");
+    if (!contentType || !contentType.includes("application/json")) {
+      const text = await apiResponse.text();
+      return res.status(500).json({ error: 'Resposta não-JSON recebida do Mercado Livre', details: text });
+    }
+
     if (!apiResponse.ok) {
        console.error('Erro da API do ML (orders):', await apiResponse.text());
        await db.ref(`ml_accounts/${uid}/${seller_id}`).update({ status: 'error' });
