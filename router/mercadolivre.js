@@ -30,7 +30,7 @@ function getRedirectUri(req) {
 
 function getFrontendUrl(success = true) {
   const baseUrl = process.env.NODE_ENV === 'production'
-    ? 'https://cyberdock.com.br/contas'
+    ? 'https://cyberdock.netlify.app/contas'
     : 'http://localhost:8080/contas';
   const query = success
     ? 'success=Conta%20conectada%20com%20sucesso'
@@ -328,7 +328,18 @@ router.get('/vendas', async (req, res) => {
 
   } catch (error) {
     console.error('Erro no backend ao buscar vendas:', error);
-    res.status(500).json({ error: error.message });
+    // Log detalhado do erro para diagnóstico em produção
+    console.error('Stack trace:', error.stack);
+    console.error('Request details:', {
+      uid,
+      seller_id,
+      url: req.url,
+      headers: req.headers
+    });
+    res.status(500).json({ 
+      error: error.message,
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 

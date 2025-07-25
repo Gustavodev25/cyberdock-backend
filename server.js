@@ -8,11 +8,23 @@ const { startNgrok } = require('./ngrok');
 const app = express();
 app.use(cors({
   origin: function(origin, callback) {
-    const allowedOrigins = ['https://cyberdock.com.br', 'http://localhost:5173', 'http://localhost:8080', undefined];
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true);
+    const allowedOrigins = [
+      'https://cyberdock.com.br',
+      'http://localhost:5173',
+      'http://localhost:8080',
+      'https://cyberdock.netlify.app',
+      undefined
+    ];
+    // Em produção, permitir apenas origens conhecidas
+    if (process.env.NODE_ENV === 'production') {
+      if (allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
     } else {
-      callback(new Error('Not allowed by CORS'));
+      // Em desenvolvimento, permitir todas as origens
+      callback(null, true);
     }
   },
   credentials: true,
