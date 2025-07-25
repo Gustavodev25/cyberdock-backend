@@ -7,24 +7,18 @@ const { startNgrok } = require('./ngrok');
 
 const app = express();
 app.use(cors({
-  origin: ['https://cyberdock.com.br', 'http://localhost:5173', 'http://localhost:3000'],
-  credentials: true
+  origin: function(origin, callback) {
+    const allowedOrigins = ['https://cyberdock.com.br', 'http://localhost:5173', 'http://localhost:8080', undefined];
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
 }));
 app.use(bodyParser.json());
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  res.status(500).json({ 
-    error: 'Erro interno do servidor',
-    details: process.env.NODE_ENV === 'development' ? err.message : undefined
-  });
-});
-
-// Rota de teste/health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', environment: process.env.NODE_ENV });
-});
 
 app.use('/ml', mercadoLivreRouter);
 
