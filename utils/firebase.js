@@ -4,16 +4,21 @@ const admin = require('firebase-admin');
 if (!admin.apps.length) {
   if (process.env.NODE_ENV === 'production') {
     // Em produção, usar as variáveis de ambiente do Render
+    // Render pode passar a private_key com quebras de linha já corretas ou não
+    let privateKey = process.env.FIREBASE_PRIVATE_KEY;
+    if (privateKey && privateKey.includes('\\n')) {
+      privateKey = privateKey.replace(/\\n/g, '\n');
+    }
     const firebaseConfig = {
       type: "service_account",
       project_id: process.env.FIREBASE_PROJECT_ID,
-      private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      private_key: privateKey,
       client_email: process.env.FIREBASE_CLIENT_EMAIL,
     };
 
     admin.initializeApp({
       credential: admin.credential.cert(firebaseConfig),
-      databaseURL: process.env.FIREBASE_DB_URL
+      databaseURL: process.env.FIREBASE_DB_URL || 'https://cyberdock-9b169-default-rtdb.firebaseio.com'
     });
   } else {
     // Em desenvolvimento, usar o arquivo JSON

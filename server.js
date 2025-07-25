@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const mercadoLivreRouter = require('./router/mercadolivre');
-const shopeeRouter = require('./router/shopee');
 const { startNgrok } = require('./ngrok');
 
 const app = express();
@@ -34,7 +33,6 @@ app.use(cors({
 app.use(bodyParser.json());
 
 app.use('/ml', mercadoLivreRouter);
-app.use('/shopee', shopeeRouter);
 
 const PORT = process.env.PORT || 3001;
 
