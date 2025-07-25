@@ -23,14 +23,14 @@ function generatePKCE() {
 
 function getRedirectUri(req) {
   if (process.env.NODE_ENV === 'production') {
-    return process.env.ML_REDIRECT_URI || 'https://seu-dominio.com/ml/callback';
+    return process.env.ML_REDIRECT_URI || 'https://cyberdock-backend.onrender.com/ml/callback';
   }
   return process.env.ML_REDIRECT_URI || 'http://localhost:3001/ml/callback';
 }
 
 function getFrontendUrl(success = true) {
   const baseUrl = process.env.NODE_ENV === 'production'
-    ? 'https://seu-dominio.com/contas'
+    ? 'https://cyberdock.com.br/contas'
     : 'http://localhost:8080/contas';
   const query = success
     ? 'success=Conta%20conectada%20com%20sucesso'
