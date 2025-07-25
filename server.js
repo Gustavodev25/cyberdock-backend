@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const mercadoLivreRouter = require('./router/mercadolivre');
-const shopeeRouter = require('./router/shopee');
 const { startNgrok } = require('./ngrok');
 
 const app = express();
@@ -11,7 +10,6 @@ app.use(cors());
 app.use(bodyParser.json());
 
 app.use('/ml', mercadoLivreRouter);
-app.use('/shopee', shopeeRouter);
 
 const PORT = process.env.PORT || 3001;
 
@@ -28,12 +26,8 @@ app.listen(PORT, async () => {
     const mlRedirectUri = `${url}/ml/callback`;
     process.env.ML_REDIRECT_URI = mlRedirectUri;
 
-    // ================== ALTERAÇÃO IMPORTANTE ==================
-    // Adiciona a URL do Ngrok a uma variável de ambiente para a Shopee
-    const shopeeRedirectUri = `${url}/shopee/callback`;
-    process.env.SHOPEE_REDIRECT_URI = shopeeRedirectUri;
-    console.log(`Variável de ambiente SHOPEE_REDIRECT_URI definida como: ${process.env.SHOPEE_REDIRECT_URI}`);
-    // ==========================================================
+    // Registra a URL do ngrok no console
+    console.log('URL do backend (ngrok):', url);
 
     // Atualiza o .env do frontend com a VITE_API_URL (existente)
     const frontendEnvPath = path.join(__dirname, '..', '.env');
