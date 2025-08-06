@@ -1,12 +1,14 @@
 const { Pool } = require('pg');
 
 const pool = new Pool({
-  user: 'postgres_cyber_dock_user', 
-  host: 'dpg-d29mquer433s739ir01g-a', 
-  database: 'postgres_cyber_dock', 
-  password: 'KVT8w15r7n2EDQQ7w4TNxI8HvR09JZ0u', 
+  user: 'postgres_cyber_dock_user',
+  host: 'dpg-d29mquer433s739ir01g-a.oregon-postgres.render.com',
+  database: 'postgres_cyber_dock',
+  password: 'KVT8w15r7n2EDQQ7w4TNxI8HvR09JZ0u',
   port: 5432,
-  ssl: false,
+  ssl: {
+    rejectUnauthorized: false
+  },
 });
 
 pool.query('SELECT NOW()', (err, res) => {
