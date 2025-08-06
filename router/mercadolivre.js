@@ -33,7 +33,7 @@ function getRedirectUri() {
     const basePath = '/api/ml/callback'; // <-- CORREÇÃO: Adicionado /api ao caminho
 
     if (process.env.NODE_ENV === 'production') {
-        const prodDomain = process.env.ML_REDIRECT_URI || 'https://SEU_DOMINIO_DE_PRODUCAO';
+        const prodDomain = process.env.ML_REDIRECT_URI || 'https://cyberdock-backend.onrender.com';
         return `${prodDomain}${basePath}`;
     }
     
