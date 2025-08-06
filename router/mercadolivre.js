@@ -30,22 +30,12 @@ function generatePKCE() {
  * Determina a URI de redirecionamento correta, incluindo o prefixo /api.
  */
 function getRedirectUri() {
-    const basePath = '/api/ml/callback';
+    // Sempre retorna a URL exata cadastrada no Mercado Livre e usada no frontend
     if (process.env.NODE_ENV === 'production') {
-        let prodRedirect = process.env.ML_REDIRECT_URI || 'https://cyberdock-backend.onrender.com';
-        // Se já contém o caminho completo, retorna como está
-        if (prodRedirect.endsWith(basePath)) {
-            return prodRedirect;
-        }
-        // Se não, concatena
-        return `${prodRedirect}${basePath}`;
+        return 'https://cyberdock-backend.onrender.com/api/ml/callback';
     }
-    const ngrokUrl = process.env.NGROK_URL;
-    if (!ngrokUrl) {
-        console.warn('Variável de ambiente NGROK_URL não definida. O callback pode falhar.');
-        return `http://localhost:3001${basePath}`;
-    }
-    return `${ngrokUrl}${basePath}`;
+    // Para desenvolvimento local, pode usar o valor do frontend/config.js
+    return 'http://localhost:8080/mercadolivre/callback';
 }
 
 // --- Rota de Autenticação ---
