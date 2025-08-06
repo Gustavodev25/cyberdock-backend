@@ -49,7 +49,7 @@ function getRedirectUri() {
 
 // --- Rota de Autenticação ---
 router.get('/auth', (req, res) => {
-    const { uid } = req.query;
+    const { uid, client_id, redirect_uri } = req.query;
     if (!uid) {
         return res.status(400).send('UID do usuário é obrigatório.');
     }
@@ -58,13 +58,15 @@ router.get('/auth', (req, res) => {
     const state = base64urlEncode(Buffer.from(JSON.stringify({ uid })));
     codeVerifiers.set(state, codeVerifier);
 
-    const redirectUri = getRedirectUri();
-    console.log(`Iniciando autenticação para UID: ${uid}. Redirecionando para: ${redirectUri}`);
+    // Prioriza parâmetros recebidos, senão usa padrão do backend
+    const finalClientId = client_id || CLIENT_ID;
+    const finalRedirectUri = redirect_uri || getRedirectUri();
+    console.log(`Iniciando autenticação para UID: ${uid}. Redirecionando para: ${finalRedirectUri}`);
 
     const authUrl = `https://auth.mercadolibre.com/authorization` +
         `?response_type=code` +
-        `&client_id=${CLIENT_ID}` +
-        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&client_id=${finalClientId}` +
+        `&redirect_uri=${encodeURIComponent(finalRedirectUri)}` +
         `&state=${state}` +
         `&code_challenge=${codeChallenge}` +
         `&code_challenge_method=S256`;
