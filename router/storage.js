@@ -1,0 +1,389 @@
+// backend/router/storage.js
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const db = require('../utils/postgres');
+
+const router = express.Router();
+const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto-para-jwt';
+
+// --- Middlewares ---
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Token de acesso requerido' });
+
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Token inválido' });
+        req.user = user;
+        next();
+    });
+};
+
+const requireMaster = (req, res, next) => {
+    if (req.user.role !== 'master') {
+        return res.status(403).json({ error: 'Acesso negado.' });
+    }
+    next();
+};
+
+// --- ROTAS PARA TIPOS DE PACOTE (PACKAGE TYPES) ---
+
+// GET /api/storage/package-types - Listar todos os tipos de pacote
+router.get('/package-types', authenticateToken, async (req, res) => {
+    try {
+        const { rows } = await db.query('SELECT id, name, price FROM public.package_types ORDER BY name ASC');
+        const formattedRows = rows.map(pt => ({ ...pt, price: parseFloat(pt.price) }));
+        res.json(formattedRows);
+    } catch (error) {
+        console.error('Erro ao buscar tipos de pacote:', error);
+        res.status(500).json({ error: 'Erro interno do servidor.' });
+    }
+});
+
+// POST /api/storage/package-types - Criar um novo tipo de pacote (master only)
+router.post('/package-types', authenticateToken, requireMaster, async (req, res) => {
+    const { name, price } = req.body;
+    if (!name || price == null) {
+        return res.status(400).json({ error: 'Nome e preço são obrigatórios.' });
+    }
+    try {
+        const { rows } = await db.query(
+            'INSERT INTO public.package_types (name, price) VALUES ($1, $2) RETURNING *',
+            [name, parseFloat(price)]
+        );
+        res.status(201).json(rows[0]);
+    } catch (error) {
+        console.error('Erro ao criar tipo de pacote:', error);
+        res.status(500).json({ error: 'Erro interno do servidor.' });
+    }
+});
+
+// PUT /api/storage/package-types/:id - Atualizar um tipo de pacote (master only)
+router.put('/package-types/:id', authenticateToken, requireMaster, async (req, res) => {
+    const { id } = req.params;
+    const { name, price } = req.body;
+    if (!name || price == null) {
+        return res.status(400).json({ error: 'Nome e preço são obrigatórios.' });
+    }
+    try {
+        const { rows } = await db.query(
+            'UPDATE public.package_types SET name = $1, price = $2 WHERE id = $3 RETURNING *',
+            [name, parseFloat(price), id]
+        );
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Tipo de pacote não encontrado.' });
+        }
+        res.json(rows[0]);
+    } catch (error) {
+        console.error('Erro ao atualizar tipo de pacote:', error);
+        res.status(500).json({ error: 'Erro interno do servidor.' });
+    }
+});
+
+// DELETE /api/storage/package-types/:id - Deletar um tipo de pacote (master only)
+router.delete('/package-types/:id', authenticateToken, requireMaster, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const { rowCount } = await db.query('DELETE FROM public.package_types WHERE id = $1', [id]);
+        if (rowCount === 0) {
+            return res.status(404).json({ error: 'Tipo de pacote não encontrado.' });
+        }
+        res.status(200).json({ message: 'Tipo de pacote excluído com sucesso.' });
+    } catch (error) {
+        console.error('Erro ao deletar tipo de pacote:', error);
+        if (error.code === '23503') { // foreign key violation
+            return res.status(400).json({ error: 'Não é possível excluir. Este tipo de pacote está em uso por um ou mais SKUs.' });
+        }
+        res.status(500).json({ error: 'Erro interno do servidor.' });
+    }
+});
+
+
+// --- ROTA DE CÁLCULO DE FATURAMENTO DE ARMAZENAMENTO ---
+router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const contractsQuery = `
+            SELECT s.type, uc.price, uc.volume
+            FROM public.user_contracts uc
+            JOIN public.services s ON uc.service_id = s.id
+            WHERE uc.uid = $1 AND s.type IN ('base_storage', 'additional_storage');
+        `;
+        const contractsResult = await db.query(contractsQuery, [userId]);
+        
+        let totalCost = 0, baseCost = 0, additionalCost = 0, additionalVolume = 0;
+
+        const baseService = contractsResult.rows.find(c => c.type === 'base_storage');
+        if (baseService) baseCost = parseFloat(baseService.price);
+
+        const additionalServiceContract = contractsResult.rows.find(c => c.type === 'additional_storage');
+        if (additionalServiceContract) {
+            const price = parseFloat(additionalServiceContract.price);
+            const quantity = parseInt(additionalServiceContract.volume, 10) || 0;
+            additionalCost = price * quantity;
+            additionalVolume = quantity;
+        }
+
+        totalCost = baseCost + additionalCost;
+
+        const volumeQuery = `
+            SELECT COALESCE(SUM((s.dimensoes->>'altura')::numeric * (s.dimensoes->>'largura')::numeric * (s.dimensoes->>'comprimento')::numeric / 1000000 * s.quantidade), 0) as total_volume
+            FROM public.skus s
+            WHERE s.user_id = $1;
+        `;
+        const volumeResult = await db.query(volumeQuery, [userId]);
+        const consumedVolume = parseFloat(volumeResult.rows[0].total_volume);
+
+        res.json({ consumedVolume, baseCost, additionalVolume, additionalCost, totalCost });
+    } catch (error) {
+        console.error('Erro ao calcular faturamento de armazenamento:', error);
+        res.status(500).json({ error: 'Erro interno ao calcular faturamento.' });
+    }
+});
+
+
+// --- ROTAS DE GERENCIAMENTO DE SKU ---
+
+router.get('/user/:userId/skus', authenticateToken, requireMaster, async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const query = `
+            SELECT 
+                s.id, s.user_id, s.sku, s.descricao, s.dimensoes, s.quantidade, s.package_type_id,
+                pt.name as package_type_name, pt.price as package_type_price
+            FROM public.skus s
+            LEFT JOIN public.package_types pt ON s.package_type_id = pt.id
+            WHERE s.user_id = $1 
+            ORDER BY s.created_at DESC
+        `;
+        const { rows } = await db.query(query, [userId]);
+        const skus = rows.map(sku => ({
+            ...sku,
+            dimensoes: typeof sku.dimensoes === 'string' ? JSON.parse(sku.dimensoes) : sku.dimensoes,
+            package_type_price: sku.package_type_price ? parseFloat(sku.package_type_price) : null
+        }));
+        res.json(skus);
+    } catch (error) {
+        console.error('Erro ao buscar SKUs do usuário:', error);
+        res.status(500).json({ error: 'Erro interno ao buscar SKUs.' });
+    }
+});
+
+router.post('/user/:userId/skus', authenticateToken, requireMaster, async (req, res) => {
+    const { userId } = req.params;
+    const { sku, descricao, dimensoes, quantidade, package_type_id } = req.body;
+
+    if (!sku || !descricao || !dimensoes || quantidade == null) {
+        return res.status(400).json({ error: 'Campos de SKU, descrição, dimensões e quantidade são obrigatórios.' });
+    }
+
+    const client = await db.pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const insertSkuQuery = `
+            INSERT INTO public.skus (user_id, sku, descricao, dimensoes, quantidade, package_type_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id;
+        `;
+        const skuResult = await client.query(insertSkuQuery, [userId, sku, descricao, JSON.stringify(dimensoes), quantidade, package_type_id || null]);
+        const newSkuId = skuResult.rows[0].id;
+
+        if (quantidade > 0) {
+            const insertMovementQuery = `
+                INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason)
+                VALUES ($1, $2, 'entrada', $3, 'Entrada inicial de estoque');
+            `;
+            await client.query(insertMovementQuery, [newSkuId, userId, quantidade]);
+        }
+
+        await client.query('COMMIT');
+        res.status(201).json({ message: 'SKU adicionado com sucesso', skuId: newSkuId });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Erro ao adicionar novo SKU:', error);
+        if (error.code === '23505') {
+            return res.status(409).json({ error: 'Este código SKU já existe para este usuário.' });
+        }
+        res.status(500).json({ error: 'Erro interno ao adicionar SKU.' });
+    } finally {
+        client.release();
+    }
+});
+
+router.put('/skus/:skuId', authenticateToken, requireMaster, async (req, res) => {
+    const { skuId } = req.params;
+    const { descricao, dimensoes, package_type_id } = req.body;
+
+    if (!descricao || !dimensoes) {
+        return res.status(400).json({ error: 'Descrição e dimensões são obrigatórios.' });
+    }
+
+    try {
+        const query = `
+            UPDATE public.skus
+            SET descricao = $1, dimensoes = $2, package_type_id = $3, updated_at = NOW()
+            WHERE id = $4
+            RETURNING *;
+        `;
+        const { rows } = await db.query(query, [descricao, JSON.stringify(dimensoes), package_type_id || null, skuId]);
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'SKU não encontrado.' });
+        }
+        res.json(rows[0]);
+    } catch (error) {
+        console.error('Erro ao atualizar SKU:', error);
+        res.status(500).json({ error: 'Erro interno ao atualizar SKU.' });
+    }
+});
+
+// ROTA DE EXCLUSÃO DE SKU CORRIGIDA
+router.delete('/skus/:skuId', authenticateToken, requireMaster, async (req, res) => {
+    const { skuId } = req.params;
+    const client = await db.pool.connect(); // Usar um cliente para a transação
+
+    try {
+        await client.query('BEGIN');
+
+        // 1. Verificar se o SKU existe e se a quantidade é zero.
+        const skuCheck = await client.query('SELECT quantidade FROM public.skus WHERE id = $1 FOR UPDATE', [skuId]);
+
+        if (skuCheck.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'SKU não encontrado.' });
+        }
+
+        if (skuCheck.rows[0].quantidade > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Não é possível excluir SKU com estoque positivo. Zere o estoque primeiro.' });
+        }
+
+        // 2. Excluir explicitamente as movimentações de estoque relacionadas.
+        //    Isso torna a operação segura mesmo se ON DELETE CASCADE não estiver configurado no DB.
+        await client.query('DELETE FROM public.stock_movements WHERE sku_id = $1', [skuId]);
+
+        // 3. Agora, excluir o próprio SKU.
+        const { rowCount } = await client.query('DELETE FROM public.skus WHERE id = $1', [skuId]);
+
+        if (rowCount === 0) {
+            // Este caso não deve ser alcançado devido à verificação inicial, mas é uma segurança extra.
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Falha ao excluir o SKU após limpar o histórico.' });
+        }
+
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'SKU e seu histórico foram excluídos com sucesso.' });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Erro ao deletar SKU:', error);
+        // Verifica erros específicos de chave estrangeira, caso outra tabela referencie skus
+        if (error.code === '23503') {
+            return res.status(400).json({ error: 'Não é possível excluir. O SKU está sendo referenciado em outra parte do sistema.' });
+        }
+        res.status(500).json({ error: 'Erro interno ao deletar SKU.' });
+    } finally {
+        client.release();
+    }
+});
+
+
+// --- ROTAS DE MOVIMENTAÇÃO DE ESTOQUE ---
+
+router.get('/user/:userId/movements', authenticateToken, async (req, res) => {
+    const { userId } = req.params;
+    if (req.user.role !== 'master' && req.user.uid !== userId) {
+        return res.status(403).json({ error: 'Acesso negado.' });
+    }
+    try {
+        const query = `
+            SELECT 
+                sm.id, s.sku, sm.movement_type, sm.quantity_change, sm.reason, 
+                sm.related_sale_id, sm.created_at
+            FROM public.stock_movements sm
+            JOIN public.skus s ON sm.sku_id = s.id
+            WHERE sm.user_id = $1
+            ORDER BY sm.created_at DESC
+        `;
+        const { rows } = await db.query(query, [userId]);
+        res.json(rows);
+    } catch (error) {
+        console.error('Erro ao buscar todas as movimentações do usuário:', error);
+        res.status(500).json({ error: 'Erro interno ao buscar movimentações.' });
+    }
+});
+
+
+router.get('/sku/:skuCode/movements', authenticateToken, requireMaster, async (req, res) => {
+    const { skuCode } = req.params;
+    const { uid } = req.query;
+
+    if (!uid) return res.status(400).json({ error: 'UID do usuário é obrigatório.' });
+
+    try {
+        const query = `
+            SELECT sm.id, sm.movement_type, sm.quantity_change, sm.reason, sm.related_sale_id, sm.created_at
+            FROM public.stock_movements sm
+            JOIN public.skus s ON sm.sku_id = s.id
+            WHERE s.sku = $1 AND sm.user_id = $2
+            ORDER BY sm.created_at DESC
+        `;
+        const { rows } = await db.query(query, [skuCode, uid]);
+        res.json(rows);
+    } catch (error) {
+        console.error('Erro ao buscar histórico do SKU:', error);
+        res.status(500).json({ error: 'Erro interno ao buscar histórico.' });
+    }
+});
+
+router.post('/sku/:skuCode/movements', authenticateToken, requireMaster, async (req, res) => {
+    const { skuCode } = req.params;
+    const { userId, movementType, quantityChange, reason, relatedSaleId } = req.body;
+
+    if (!userId || !movementType || !quantityChange || !reason) {
+        return res.status(400).json({ error: 'Todos os campos são obrigatórios.' });
+    }
+
+    const client = await db.pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const findSkuQuery = 'SELECT id, quantidade FROM public.skus WHERE sku = $1 AND user_id = $2 FOR UPDATE';
+        const skuFound = await client.query(findSkuQuery, [skuCode, userId]);
+
+        if (skuFound.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'SKU não encontrado ou pertence a outro usuário.' });
+        }
+        const { id: skuId, quantidade: currentQuantity } = skuFound.rows[0];
+
+        const finalQuantityChange = movementType === 'entrada' ? quantityChange : -quantityChange;
+
+        if (movementType === 'saida' && currentQuantity < quantityChange) {
+             console.warn(`Alerta: Estoque do SKU ${skuCode} ficará negativo. Estoque atual: ${currentQuantity}, Saída: ${quantityChange}`);
+        }
+
+        const updateSkuQuery = `
+            UPDATE public.skus SET quantidade = quantidade + $1, updated_at = NOW() WHERE id = $2;
+        `;
+        await client.query(updateSkuQuery, [finalQuantityChange, skuId]);
+
+        const insertMovementQuery = `
+            INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+            VALUES ($1, $2, $3, $4, $5, $6) RETURNING *;
+        `;
+        await client.query(insertMovementQuery, [skuId, userId, movementType, quantityChange, reason, relatedSaleId || null]);
+
+        await client.query('COMMIT');
+        res.status(201).json({ message: 'Movimentação registrada com sucesso.' });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Erro ao registrar ajuste de estoque:', error);
+        res.status(500).json({ error: 'Erro interno ao ajustar estoque.' });
+    } finally {
+        client.release();
+    }
+});
+
+module.exports = router;
