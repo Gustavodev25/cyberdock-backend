@@ -30,20 +30,21 @@ function generatePKCE() {
  * Determina a URI de redirecionamento correta, incluindo o prefixo /api.
  */
 function getRedirectUri() {
-    const basePath = '/api/ml/callback'; // <-- CORREÇÃO: Adicionado /api ao caminho
-
+    const basePath = '/api/ml/callback';
     if (process.env.NODE_ENV === 'production') {
-        const prodDomain = process.env.ML_REDIRECT_URI || 'https://cyberdock-backend.onrender.com';
-        return `${prodDomain}${basePath}`;
+        let prodRedirect = process.env.ML_REDIRECT_URI || 'https://cyberdock-backend.onrender.com';
+        // Se já contém o caminho completo, retorna como está
+        if (prodRedirect.endsWith(basePath)) {
+            return prodRedirect;
+        }
+        // Se não, concatena
+        return `${prodRedirect}${basePath}`;
     }
-    
     const ngrokUrl = process.env.NGROK_URL;
     if (!ngrokUrl) {
         console.warn('Variável de ambiente NGROK_URL não definida. O callback pode falhar.');
         return `http://localhost:3001${basePath}`;
     }
-    
-    // Constrói a URL completa com o prefixo /api
     return `${ngrokUrl}${basePath}`;
 }
 
