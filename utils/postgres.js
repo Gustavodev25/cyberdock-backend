@@ -1,12 +1,12 @@
 const { Pool } = require('pg');
 
 const pool = new Pool({
-  user: process.env.PGUSER || 'postgres',
-  host: process.env.PGHOST || 'localhost',
-  database: process.env.PGDATABASE || 'cyberdock',
-  password: process.env.PGPASSWORD || 'Gustavo2501',
+  user: process.env.PGUSER || 'postgres_cyber_dock_user',
+  host: process.env.PGHOST || 'dpg-d29mquer433s739ir01g-a.oregon-postgres.render.com',
+  database: process.env.PGDATABASE || 'postgres_cyber_dock',
+  password: process.env.PGPASSWORD || 'KVT8w15r7n2EDQQ7w4TNxI8HvR09JZ0u',
   port: process.env.PGPORT ? parseInt(process.env.PGPORT) : 5432,
-  // ssl: { rejectUnauthorized: false }, // Descomente se for usar SSL
+  ssl: { rejectUnauthorized: false }, // Necessário para conexão externa segura
 });
 
 pool.query('SELECT NOW()', (err, res) => {
@@ -20,5 +20,5 @@ pool.query('SELECT NOW()', (err, res) => {
 module.exports = {
   query: (text, params) => pool.query(text, params),
   pool,
-  getClient: () => pool.connect(), 
+  getClient: () => pool.connect(),
 };
