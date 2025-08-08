@@ -29,12 +29,25 @@ function generatePKCE() {
 /**
  * Determina a URI de redirecionamento correta, incluindo o prefixo /api.
  */
+const fs = require('fs');
 function getRedirectUri() {
-    // Sempre retorna a URL exata cadastrada no Mercado Livre e usada no frontend
+    // Permite sobrescrever via variável de ambiente, se necessário
+    if (process.env.ML_REDIRECT_URI) {
+        return process.env.ML_REDIRECT_URI;
+    }
+    // Produção: callback cadastrado no Mercado Livre
     if (process.env.NODE_ENV === 'production') {
         return 'https://cyberdock-backend.onrender.com/api/ml/callback';
     }
-    // Para desenvolvimento local, pode usar o valor do frontend/config.js
+    // Desenvolvimento: usa ngrok se disponível
+    try {
+        const ngrokUrl = fs.readFileSync(require('path').resolve(__dirname, '../ngrok-url.txt'), 'utf8').trim();
+        if (ngrokUrl && ngrokUrl.startsWith('http')) {
+            return `${ngrokUrl}/api/ml/callback`;
+        }
+    } catch (err) {
+        // Se não conseguir ler ngrok, cai para localhost
+    }
     return 'http://localhost:8080/mercadolivre/callback';
 }
 
