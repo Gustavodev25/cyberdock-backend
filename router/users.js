@@ -8,18 +8,41 @@ const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
 const router = express.Router();
 
 // --- Rota para listar todos os usuários (apenas masters) ---
+// ATUALIZADO: Agora inclui o apelido do Mercado Livre
 router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     try {
+        // Query com LEFT JOIN para buscar o apelido mais recente da conta ML
         const usersQuery = `
-            SELECT uid, email, role, created_at
-            FROM public.users 
-            ORDER BY created_at DESC
+            SELECT
+                u.uid,
+                u.email,
+                u.role,
+                u.created_at,
+                ma.nickname AS "mlNickname"
+            FROM
+                public.users u
+            LEFT JOIN (
+                SELECT
+                    uid,
+                    nickname,
+                    ROW_NUMBER() OVER(PARTITION BY uid ORDER BY connected_at DESC) as rn
+                FROM
+                    public.ml_accounts
+            ) ma ON u.uid = ma.uid AND ma.rn = 1
+            ORDER BY
+                u.created_at DESC;
         `;
         const { rows } = await db.query(usersQuery);
+        
+        // O mapeamento agora já inclui o mlNickname, se existir
         const formattedUsers = rows.map(user => ({
-            ...user,
-            createdAt: user.created_at
+            uid: user.uid,
+            email: user.email,
+            role: user.role,
+            createdAt: user.created_at,
+            mlNickname: user.mlNickname // Este campo vem direto do DB
         }));
+
         res.json(formattedUsers);
     } catch (error) {
         console.error('Erro ao buscar usuários:', error);
