@@ -12,15 +12,17 @@ const schema = {
     services: `
         CREATE TABLE public.services (
             id SERIAL PRIMARY KEY,
-            name VARCHAR(255) NOT NULL,
+            name VARCHAR(255) NOT NULL UNIQUE,
             price NUMERIC(10,2) NOT NULL,
             description TEXT,
-            type VARCHAR(50)
+            type VARCHAR(50),
+            config JSONB
         );`,
     users: `
         CREATE TABLE public.users (
             uid VARCHAR(255) PRIMARY KEY,
             email VARCHAR(255) UNIQUE NOT NULL,
+            name VARCHAR(255),
             role VARCHAR(50) NOT NULL DEFAULT 'cliente',
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             password_hash VARCHAR(255)
@@ -124,7 +126,8 @@ const schema = {
             quantity INTEGER NOT NULL,
             unit_price NUMERIC(10, 2) NOT NULL,
             total_price NUMERIC(10, 2) NOT NULL,
-            type VARCHAR(50) NOT NULL
+            type VARCHAR(50) NOT NULL,
+            service_date DATE
         );`
 };
 
@@ -134,7 +137,6 @@ async function syncDatabaseSchema() {
         console.log('--- Iniciando sincronização do esquema do banco de dados ---');
         const res = await client.query(`SELECT tablename FROM pg_tables WHERE schemaname = 'public'`);
         const existingTables = res.rows.map(row => row.tablename);
-        const desiredTables = Object.keys(schema);
         
         const tablesInOrder = [
             'users', 'package_types', 'services', 'ml_accounts', 'system_settings',
@@ -147,6 +149,33 @@ async function syncDatabaseSchema() {
             if (!existingTables.includes(tableName)) {
                 console.log(`   -> Criando tabela: public.${tableName}`);
                 await client.query(schema[tableName]);
+            } else {
+                if (tableName === 'users') {
+                    const colRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'name'`);
+                    if (colRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'name' à tabela: public.users`);
+                        await client.query('ALTER TABLE public.users ADD COLUMN name VARCHAR(255);');
+                    }
+                }
+                 if (tableName === 'services') {
+                    const colRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'services' AND column_name = 'config'`);
+                    if (colRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'config' à tabela: public.services`);
+                        await client.query('ALTER TABLE public.services ADD COLUMN config JSONB;');
+                    }
+                    const constraintRes = await client.query(`SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'services' AND constraint_type = 'UNIQUE' AND table_schema = 'public' AND constraint_name = 'services_name_key';`);
+                    if(constraintRes.rowCount === 0) {
+                        console.log(`   -> Adicionando restrição UNIQUE à coluna 'name' em public.services`);
+                        await client.query('ALTER TABLE public.services ADD CONSTRAINT services_name_key UNIQUE (name);');
+                    }
+                }
+                if (tableName === 'invoice_items') {
+                    const colRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'invoice_items' AND column_name = 'service_date'`);
+                    if (colRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'service_date' à tabela: public.invoice_items`);
+                        await client.query('ALTER TABLE public.invoice_items ADD COLUMN service_date DATE;');
+                    }
+                }
             }
         }
         await client.query('COMMIT');
@@ -174,36 +203,23 @@ async function seedInitialData() {
                     ('Expedição Comum', 2.97),
                     ('Expedição Premium', 3.97)`
             );
-            console.log('Tipos de pacote padrão inseridos.');
         }
 
-        const servicesCheck = await client.query('SELECT COUNT(*) FROM public.services');
-        if (parseInt(servicesCheck.rows[0].count, 10) === 0) {
-            console.log('Nenhum serviço encontrado. Inserindo exemplos...');
-            await client.query(
-                `INSERT INTO public.services (name, price, description, type) VALUES 
-                    ('Armazenamento Base (até 1m³)', 397.00, 'Taxa base de armazenamento para o primeiro metro cúbico.', 'base_storage'),
-                    ('Metro Cúbico Adicional', 197.00, 'Custo por cada metro cúbico adicional utilizado.', 'additional_storage')`
-            );
-            console.log('Serviços de exemplo inseridos.');
+        const servicesCheck = await client.query("SELECT COUNT(*) FROM public.services WHERE type IN ('base_storage', 'additional_storage', 'avulso_simples', 'avulso_quantidade')");
+        if (parseInt(servicesCheck.rows[0].count, 10) < 5) {
+            console.log('Serviços não encontrados ou incompletos. Inserindo/Atualizando...');
+            
+            await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Armazenamento Base (até 1m³)', 397.00, 'Taxa base de armazenamento para o primeiro metro cúbico.', 'base_storage'), ('Metro Cúbico Adicional', 197.00, 'Custo por cada metro cúbico adicional utilizado.', 'additional_storage') ON CONFLICT (name) DO NOTHING;`);
+            await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Coleta CyberSegura', 50.00, 'Serviço de coleta avulso.', 'avulso_simples'), ('Transbordo Full CyberSeguro', 75.00, 'Serviço de transbordo avulso.', 'avulso_simples') ON CONFLICT (name) DO NOTHING;`);
+
+            const montagemFullConfig = { tiers: [ { from: 1, to: 100, price: 1.49 }, { from: 101, to: 300, price: 1.29 }, { from: 301, to: null, price: 1.09 } ] };
+            await client.query(`INSERT INTO public.services (name, price, description, type, config) VALUES ('Montagem de Full', 0, 'Montagem de pacotes para envio Full. O preço varia com a quantidade.', 'avulso_quantidade', $1) ON CONFLICT (name) DO UPDATE SET config = EXCLUDED.config;`, [JSON.stringify(montagemFullConfig)]);
         }
 
-        const defaultStatuses = [
-            { value: 'custom_01_imprimir_etiqueta', label: '01 Imprimir Etiqueta' },
-            { value: 'custom_02_preparar_pacote', label: '02 Preparar Pacote' },
-            { value: 'custom_03_pacote_embalado', label: '03 Pacote Embalado' },
-            { value: 'custom_04_aguardando_coleta', label: '04 Aguardando Coleta' },
-            { value: 'custom_05_enviado', label: '05 Enviado' },
-            { value: 'custom_06_despachado', label: '06 Despachado' }
-        ];
+        const defaultStatuses = [ { value: 'custom_01_imprimir_etiqueta', label: '01 Imprimir Etiqueta' }, { value: 'custom_02_preparar_pacote', label: '02 Preparar Pacote' }, { value: 'custom_03_pacote_embalado', label: '03 Pacote Embalado' }, { value: 'custom_04_aguardando_coleta', label: '04 Aguardando Coleta' }, { value: 'custom_05_enviado', label: '05 Enviado' }, { value: 'custom_06_despachado', label: '06 Despachado' } ];
         const statusesCheck = await client.query("SELECT 1 FROM public.system_settings WHERE key = 'sales_statuses'");
         if (statusesCheck.rows.length === 0) {
-            console.log('Nenhuma configuração de status encontrada. Inserindo padrões...');
-            await client.query(
-                'INSERT INTO public.system_settings (key, value) VALUES ($1, $2)',
-                ['sales_statuses', JSON.stringify(defaultStatuses)]
-            );
-            console.log('Status padrão inseridos.');
+            await client.query('INSERT INTO public.system_settings (key, value) VALUES ($1, $2)', ['sales_statuses', JSON.stringify(defaultStatuses)]);
         }
 
         await client.query('COMMIT');
