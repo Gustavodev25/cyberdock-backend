@@ -103,8 +103,20 @@ router.delete('/package-types/:id', authenticateToken, requireMaster, async (req
 router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, async (req, res) => {
     const { userId } = req.params;
     try {
+        // 1. Busca os preços MESTRE diretamente da tabela de serviços.
+        const masterPricesQuery = `SELECT type, price FROM public.services WHERE type IN ('base_storage', 'additional_storage');`;
+        const masterPricesResult = await db.query(masterPricesQuery);
+        const masterPrices = masterPricesResult.rows.reduce((acc, service) => {
+            acc[service.type] = parseFloat(service.price);
+            return acc;
+        }, {});
+
+        const masterBasePrice = masterPrices['base_storage'] || 0;
+        const masterAdditionalPrice = masterPrices['additional_storage'] || 0;
+
+        // 2. Busca os contratos do usuário para saber O QUE ele contratou.
         const contractsQuery = `
-            SELECT s.type, uc.price, uc.volume
+            SELECT s.type, uc.volume
             FROM public.user_contracts uc
             JOIN public.services s ON uc.service_id = s.id
             WHERE uc.uid = $1 AND s.type IN ('base_storage', 'additional_storage');
@@ -114,13 +126,14 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, as
         let totalCost = 0, baseCost = 0, additionalCost = 0, additionalVolume = 0;
 
         const baseService = contractsResult.rows.find(c => c.type === 'base_storage');
-        if (baseService) baseCost = parseFloat(baseService.price);
+        if (baseService) {
+            baseCost = masterBasePrice;
+        }
 
         const additionalServiceContract = contractsResult.rows.find(c => c.type === 'additional_storage');
         if (additionalServiceContract) {
-            const price = parseFloat(additionalServiceContract.price);
             const quantity = parseInt(additionalServiceContract.volume, 10) || 0;
-            additionalCost = price * quantity;
+            additionalCost = masterAdditionalPrice * quantity;
             additionalVolume = quantity;
         }
 
@@ -134,7 +147,49 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, as
         const volumeResult = await db.query(volumeQuery, [userId]);
         const consumedVolume = parseFloat(volumeResult.rows[0].total_volume);
 
-        res.json({ consumedVolume, baseCost, additionalVolume, additionalCost, totalCost });
+        // 3. NOVO: CÁLCULO DE CUSTO DE EXPEDIÇÃO PARA O MÊS ATUAL
+        const now = new Date();
+        const year = now.getUTCFullYear();
+        const month = now.getUTCMonth(); // 0-11
+        const startDate = new Date(Date.UTC(year, month, 1));
+        const endDate = new Date(Date.UTC(year, month + 1, 1, 0, 0, 0, -1));
+
+        const shipmentsQuery = `
+            SELECT sm.quantity_change, pt.name as package_type_name, pt.price as package_type_price
+            FROM public.stock_movements sm
+            JOIN public.skus s ON sm.sku_id = s.id
+            JOIN public.package_types pt ON s.package_type_id = pt.id
+            WHERE sm.user_id = $1
+              AND sm.movement_type = 'saida'
+              AND sm.reason LIKE 'Saída por Venda%'
+              AND sm.created_at BETWEEN $2 AND $3;
+        `;
+        const shipmentsResult = await db.query(shipmentsQuery, [userId, startDate, endDate]);
+        
+        let expedicaoComumCost = 0;
+        let expedicaoPremiumCost = 0;
+
+        for (const shipment of shipmentsResult.rows) {
+            if (shipment.package_type_name === 'Expedição Comum') {
+                expedicaoComumCost += shipment.quantity_change * parseFloat(shipment.package_type_price);
+            } else if (shipment.package_type_name === 'Expedição Premium') {
+                expedicaoPremiumCost += shipment.quantity_change * parseFloat(shipment.package_type_price);
+            }
+        }
+
+        // Adiciona os custos de expedição ao custo total
+        totalCost += expedicaoComumCost + expedicaoPremiumCost;
+
+        res.json({ 
+            consumedVolume, 
+            baseCost, 
+            additionalVolume, 
+            additionalCost, 
+            expedicaoComumCost, 
+            expedicaoPremiumCost,
+            totalCost 
+        });
+
     } catch (error) {
         console.error('Erro ao calcular faturamento de armazenamento:', error);
         res.status(500).json({ error: 'Erro interno ao calcular faturamento.' });
@@ -238,15 +293,13 @@ router.put('/skus/:skuId', authenticateToken, requireMaster, async (req, res) =>
     }
 });
 
-// ROTA DE EXCLUSÃO DE SKU CORRIGIDA
 router.delete('/skus/:skuId', authenticateToken, requireMaster, async (req, res) => {
     const { skuId } = req.params;
-    const client = await db.pool.connect(); // Usar um cliente para a transação
+    const client = await db.pool.connect(); 
 
     try {
         await client.query('BEGIN');
 
-        // 1. Verificar se o SKU existe e se a quantidade é zero.
         const skuCheck = await client.query('SELECT quantidade FROM public.skus WHERE id = $1 FOR UPDATE', [skuId]);
 
         if (skuCheck.rowCount === 0) {
@@ -259,15 +312,10 @@ router.delete('/skus/:skuId', authenticateToken, requireMaster, async (req, res)
             return res.status(400).json({ error: 'Não é possível excluir SKU com estoque positivo. Zere o estoque primeiro.' });
         }
 
-        // 2. Excluir explicitamente as movimentações de estoque relacionadas.
-        //    Isso torna a operação segura mesmo se ON DELETE CASCADE não estiver configurado no DB.
         await client.query('DELETE FROM public.stock_movements WHERE sku_id = $1', [skuId]);
-
-        // 3. Agora, excluir o próprio SKU.
         const { rowCount } = await client.query('DELETE FROM public.skus WHERE id = $1', [skuId]);
 
         if (rowCount === 0) {
-            // Este caso não deve ser alcançado devido à verificação inicial, mas é uma segurança extra.
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'Falha ao excluir o SKU após limpar o histórico.' });
         }
@@ -278,7 +326,6 @@ router.delete('/skus/:skuId', authenticateToken, requireMaster, async (req, res)
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Erro ao deletar SKU:', error);
-        // Verifica erros específicos de chave estrangeira, caso outra tabela referencie skus
         if (error.code === '23503') {
             return res.status(400).json({ error: 'Não é possível excluir. O SKU está sendo referenciado em outra parte do sistema.' });
         }

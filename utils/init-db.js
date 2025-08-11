@@ -21,7 +21,7 @@ const schema = {
         CREATE TABLE public.users (
             uid VARCHAR(255) PRIMARY KEY,
             email VARCHAR(255) UNIQUE NOT NULL,
-            role VARCHAR(50) NOT NULL DEFAULT 'usuario',
+            role VARCHAR(50) NOT NULL DEFAULT 'cliente',
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             password_hash VARCHAR(255)
         );`,
@@ -66,12 +66,12 @@ const schema = {
     skus: `
         CREATE TABLE public.skus (
             id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL,
+            user_id VARCHAR(255) NOT NULL REFERENCES public.users(uid) ON DELETE CASCADE,
             sku VARCHAR(255) NOT NULL,
             descricao TEXT,
             dimensoes JSONB,
             quantidade INTEGER DEFAULT 0,
-            package_type_id INTEGER REFERENCES public.package_types(id) ON DELETE SET NULL, -- Chave estrangeira para o tipo de pacote
+            package_type_id INTEGER REFERENCES public.package_types(id) ON DELETE SET NULL,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP WITH TIME ZONE,
             UNIQUE (user_id, sku)
@@ -103,6 +103,28 @@ const schema = {
             uid VARCHAR(255) PRIMARY KEY REFERENCES public.users(uid) ON DELETE CASCADE,
             statuses JSONB,
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );`,
+    invoices: `
+        CREATE TABLE public.invoices (
+            id SERIAL PRIMARY KEY,
+            uid VARCHAR(255) NOT NULL REFERENCES public.users(uid) ON DELETE CASCADE,
+            period VARCHAR(7) NOT NULL,
+            due_date DATE NOT NULL,
+            payment_date DATE,
+            total_amount NUMERIC(10, 2) NOT NULL,
+            status VARCHAR(50) NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(uid, period)
+        );`,
+    invoice_items: `
+        CREATE TABLE public.invoice_items (
+            id SERIAL PRIMARY KEY,
+            invoice_id INTEGER NOT NULL REFERENCES public.invoices(id) ON DELETE CASCADE,
+            description TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            unit_price NUMERIC(10, 2) NOT NULL,
+            total_price NUMERIC(10, 2) NOT NULL,
+            type VARCHAR(50) NOT NULL
         );`
 };
 
@@ -113,23 +135,22 @@ async function syncDatabaseSchema() {
         const res = await client.query(`SELECT tablename FROM pg_tables WHERE schemaname = 'public'`);
         const existingTables = res.rows.map(row => row.tablename);
         const desiredTables = Object.keys(schema);
-        const tablesToCreate = desiredTables.filter(
-            (tableName) => !existingTables.includes(tableName)
-        );
+        
+        const tablesInOrder = [
+            'users', 'package_types', 'services', 'ml_accounts', 'system_settings',
+            'user_settings', 'user_contracts', 'skus', 'sales', 'stock_movements',
+            'invoices', 'invoice_items'
+        ];
 
-        if (tablesToCreate.length === 0) {
-            console.log('✅ Esquema do banco de dados está atualizado.');
-        } else {
-            console.log('Tabelas a serem criadas:', tablesToCreate.join(', '));
-            await client.query('BEGIN');
-            for (const tableName of tablesToCreate) {
+        await client.query('BEGIN');
+        for (const tableName of tablesInOrder) {
+            if (!existingTables.includes(tableName)) {
                 console.log(`   -> Criando tabela: public.${tableName}`);
                 await client.query(schema[tableName]);
             }
-            await client.query('COMMIT');
-            console.log('✅ Novas tabelas criadas com sucesso!');
         }
-        console.log('--- Sincronização do esquema concluída ---');
+        await client.query('COMMIT');
+        console.log('✅ Esquema do banco de dados está atualizado.');
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('❌ Erro durante a sincronização do esquema:', error);
@@ -145,31 +166,28 @@ async function seedInitialData() {
         console.log('--- Verificando e inserindo dados iniciais (seeding) ---');
         await client.query('BEGIN');
 
-        // Seed Package Types
         const packageCheck = await client.query('SELECT COUNT(*) FROM public.package_types');
         if (parseInt(packageCheck.rows[0].count, 10) === 0) {
             console.log('Nenhum tipo de pacote encontrado. Inserindo padrões...');
             await client.query(
                 `INSERT INTO public.package_types (name, price) VALUES 
-                  ('Expedição Comum', 2.97),
-                  ('Expedição Premium', 3.97)`
+                    ('Expedição Comum', 2.97),
+                    ('Expedição Premium', 3.97)`
             );
             console.log('Tipos de pacote padrão inseridos.');
         }
 
-        // Seed Services
         const servicesCheck = await client.query('SELECT COUNT(*) FROM public.services');
         if (parseInt(servicesCheck.rows[0].count, 10) === 0) {
             console.log('Nenhum serviço encontrado. Inserindo exemplos...');
             await client.query(
                 `INSERT INTO public.services (name, price, description, type) VALUES 
-                  ('Armazenamento até 1m³', 150.00, 'Taxa base de armazenamento para o primeiro metro cúbico.', 'base_storage'),
-                  ('Metro Cúbico Adicional', 75.00, 'Custo por cada metro cúbico adicional utilizado.', 'additional_storage')`
+                    ('Armazenamento Base (até 1m³)', 397.00, 'Taxa base de armazenamento para o primeiro metro cúbico.', 'base_storage'),
+                    ('Metro Cúbico Adicional', 197.00, 'Custo por cada metro cúbico adicional utilizado.', 'additional_storage')`
             );
             console.log('Serviços de exemplo inseridos.');
         }
 
-        // Seed Statuses
         const defaultStatuses = [
             { value: 'custom_01_imprimir_etiqueta', label: '01 Imprimir Etiqueta' },
             { value: 'custom_02_preparar_pacote', label: '02 Preparar Pacote' },
