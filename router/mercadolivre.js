@@ -1,26 +1,16 @@
-// /router/mercadolivre.js
-
 const express = require('express');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
 const db = require('../utils/postgres');
 const router = express.Router();
 
-/**
- * Configuração fixa (sem .env)
- * - CALLBACK cadastrado no app do Mercado Livre (Render)
- * - FRONTEND aonde você quer voltar após o callback
- * - CLIENT_ID e CLIENT_SECRET fixos no código
- */
 const REDIRECT_URI = 'https://cyberdock-backend.onrender.com/api/ml/callback';
-const FRONTEND_URL = 'http://localhost:8080'; // ajuste se quiser voltar para outro front
+const FRONTEND_URL = 'http://localhost:8080';
 const CLIENT_ID = '8423050287338772';
 const CLIENT_SECRET = 'WWYgt9KH0HtZFH4YzD2yhrOLYHCUST9D';
 
-// Guardamos os code_verifiers por state (PKCE)
 const codeVerifiers = new Map();
 
-// Helpers PKCE
 function base64urlEncode(str) {
   return str.toString('base64')
     .replace(/\+/g, '-')
@@ -36,17 +26,10 @@ function generatePKCE() {
   return { codeVerifier: verifier, codeChallenge: challenge };
 }
 
-// Redirecionamento fixo (sem localhost e sem ngrok)
 function getRedirectUri() {
   return REDIRECT_URI;
 }
 
-/**
- * GET /api/ml/auth
- * Inicia autenticação no Mercado Livre (OAuth + PKCE)
- * Query: uid (obrigatório)
- * Obs: aceitamos client_id e redirect_uri por query apenas se quiser sobrescrever manualmente
- */
 router.get('/auth', (req, res) => {
   const { uid, client_id, redirect_uri } = req.query;
   if (!uid) {
@@ -57,7 +40,6 @@ router.get('/auth', (req, res) => {
   const state = base64urlEncode(Buffer.from(JSON.stringify({ uid })));
   codeVerifiers.set(state, codeVerifier);
 
-  // Permite sobrescrever via query se realmente quiser; caso contrário usa as fixas
   const finalClientId = client_id || CLIENT_ID;
   const finalRedirectUri = redirect_uri || getRedirectUri();
 
@@ -74,10 +56,6 @@ router.get('/auth', (req, res) => {
   res.redirect(authUrl);
 });
 
-/**
- * GET /api/ml/callback
- * Callback do Mercado Livre para trocar o "code" por access_token/refresh_token
- */
 router.get('/callback', async (req, res) => {
   const { code, state } = req.query;
 
@@ -95,7 +73,6 @@ router.get('/callback', async (req, res) => {
   console.log(`[ML] Callback recebido. Trocando código por token com redirect_uri: ${redirectUri}`);
 
   try {
-    // Troca do code por token
     const tokenResponse = await fetch('https://api.mercadolibre.com/oauth/token', {
       method: 'POST',
       headers: {
@@ -120,13 +97,11 @@ router.get('/callback', async (req, res) => {
 
     const tokenData = await tokenResponse.json();
 
-    // Busca dados do usuário conectado
     const userResponse = await fetch('https://api.mercadolibre.com/users/me', {
       headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
     });
     const userData = await userResponse.json();
 
-    // Salva/atualiza a conta no banco
     const { uid } = JSON.parse(Buffer.from(state, 'base64').toString('utf-8'));
     const upsertQuery = `
       INSERT INTO public.ml_accounts (
@@ -155,11 +130,6 @@ router.get('/callback', async (req, res) => {
   }
 });
 
-/**
- * POST /api/ml/refresh-token
- * Atualiza o access_token a partir do refresh_token persistido
- * Body: { uid, user_id }
- */
 router.post('/refresh-token', async (req, res) => {
   const { uid, user_id } = req.body;
 
@@ -207,10 +177,6 @@ router.post('/refresh-token', async (req, res) => {
   }
 });
 
-/**
- * GET /api/ml/contas/:uid
- * Lista contas Mercado Livre vinculadas a um UID
- */
 router.get('/contas/:uid', async (req, res) => {
   const { uid } = req.params;
   try {
@@ -225,13 +191,9 @@ router.get('/contas/:uid', async (req, res) => {
   }
 });
 
-/**
- * DELETE /api/ml/contas/:id?uid=<uid>
- * Exclui uma conta (user_id) vinculada a um UID
- */
 router.delete('/contas/:id', async (req, res) => {
   const { id } = req.params;
-  const { uid } = req.query; // UID para segurança
+  const { uid } = req.query;
   try {
     await db.query(
       'DELETE FROM public.ml_accounts WHERE user_id = $1 AND uid = $2',

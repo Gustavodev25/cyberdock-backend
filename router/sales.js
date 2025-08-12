@@ -1,4 +1,3 @@
-// routes/sales.js
 const express = require('express');
 const db = require('../utils/postgres');
 const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
@@ -6,26 +5,21 @@ const fetch = require('node-fetch');
 
 const router = express.Router();
 
-// Armazena os clientes conectados para SSE
 const clients = {};
 
-// ===== Configurações =====
 const MAX_ORDERS = 5000;
 const PAGE_LIMIT = 50;
 const SLA_CONCURRENCY = 10;
 const UPSERT_BATCH_SIZE = 300;
 
-// Proteção de batch no backend para /process
 const MAX_PROCESS_BATCH = 500;
 
-// Envia evento SSE para cliente específico
 const sendEvent = (clientId, data) => {
   if (clients[clientId]) {
     clients[clientId].res.write(`data: ${JSON.stringify(data)}\n\n`);
   }
 };
 
-// JSON seguro
 async function safeJson(res) {
   try {
     return await res.json();
@@ -34,7 +28,6 @@ async function safeJson(res) {
   }
 }
 
-// Executa map com limite de concorrência
 async function mapWithConcurrency(items, limit, mapper) {
   const ret = new Array(items.length);
   let i = 0;
@@ -63,7 +56,6 @@ async function mapWithConcurrency(items, limit, mapper) {
   });
 }
 
-// Monta linhas para inserir em lote
 function buildInsertBatchRows(orders, requesterUid, nickname) {
   const rows = [];
   for (const order of orders) {
@@ -72,6 +64,31 @@ function buildInsertBatchRows(orders, requesterUid, nickname) {
       slaData?.shipping_limit_date ||
       order?.shipping?.shipping_option?.estimated_delivery_time?.shipping_limit_date ||
       null;
+
+    let shippingMode = order?.shipping?.logistic_type || order?.shipping?.mode;
+    if (!shippingMode && Array.isArray(order.tags)) {
+        if (order.tags.includes('fulfillment') || order.tags.includes('pack_order')) {
+            shippingMode = 'fulfillment';
+        }
+    }
+
+    const translateMode = (mode) => {
+        if (!mode) return 'A verificar';
+        switch (String(mode).toLowerCase()) {
+            case 'fulfillment':
+                return 'Envio Full';
+            case 'cross_docking':
+                return 'Cross-Docking';
+            case 'drop_off':
+                return 'Ponto de Coleta';
+            case 'self_service':
+                return 'Agência ML';
+            default:
+                return mode;
+        }
+    };
+
+    const finalShippingMode = translateMode(shippingMode);
 
     for (const it of order?.order_items || []) {
       const sku = it?.item?.seller_sku;
@@ -87,7 +104,7 @@ function buildInsertBatchRows(orders, requesterUid, nickname) {
         sale_date: order.date_created,
         product_title: it?.item?.title || null,
         quantity: it?.quantity || 1,
-        shipping_mode: order?.shipping?.shipping_mode || null,
+        shipping_mode: finalShippingMode,
         shipping_limit_date: finalShippingLimitDate,
         packages: order.pack_id ? 1 : 0,
         shipping_status: order?.shipping?.status || null,
@@ -98,7 +115,6 @@ function buildInsertBatchRows(orders, requesterUid, nickname) {
   return rows;
 }
 
-// Monta query multi-insert com DO NOTHING para ignorar duplicados
 function buildMultiInsertQuery_DoNothing(rows) {
   const cols = [
     'id',
@@ -152,8 +168,6 @@ function buildMultiInsertQuery_DoNothing(rows) {
   return { query, params };
 }
 
-// ===== Rotas =====
-
 router.get('/sync-status/:clientId', (req, res) => {
   const { clientId } = req.params;
   res.writeHead(200, {
@@ -201,15 +215,6 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
   }
 });
 
-/**
- * PUT /status
- * Body: { saleId, sku, uid, shippingStatus, force?: boolean }
- * - Para "Despachado":
- *    - Se já tiver processed_at e force !== true => 400 "Venda já processada."
- *    - Se já tiver processed_at e force === true => apenas atualiza shipping_status (sem mexer no estoque)
- *    - Se não tiver processed_at => abate estoque, insere movement e marca processed_at
- * - Para outros status: apenas atualiza shipping_status
- */
 router.put('/status', authenticateToken, requireMaster, async (req, res) => {
   const { saleId, sku, uid, shippingStatus, force } = req.body;
   if (!saleId || !sku || !uid || !shippingStatus) {
@@ -223,7 +228,6 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
     try {
       await client.query('BEGIN');
 
-      // Trava a venda
       const saleQ = `
         SELECT id, sku, uid, quantity, processed_at
           FROM public.sales
@@ -238,14 +242,12 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
 
       const sale = saleR.rows[0];
 
-      // Se já processada:
       if (sale.processed_at) {
         if (!force) {
           await client.query('ROLLBACK');
           return res.status(400).json({ error: 'Venda já processada.' });
         }
 
-        // force === true -> apenas atualiza status (idempotente), sem mexer no estoque
         const updForced = `
           UPDATE public.sales
              SET shipping_status = $1,
@@ -261,7 +263,6 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
         });
       }
 
-      // Não processada ainda: abate estoque, registra movimento e marca processed_at
       const quantitySold = Number(sale.quantity || 0);
       if (!quantitySold) {
         await client.query('ROLLBACK');
@@ -318,7 +319,6 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
       try {
         await client.query('ROLLBACK');
       } catch (e) {
-        // ignore
       }
       return res.status(400).json({ error: err.message || 'Erro interno ao processar despacho.' });
     } finally {
@@ -326,7 +326,6 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
     }
   }
 
-  // Para status diferentes de "Despachado": apenas atualiza o campo
   try {
     const query = `
       UPDATE public.sales
@@ -352,7 +351,6 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
     return res.status(400).json({ error: 'Nenhuma venda para processar.' });
   }
 
-  // Sanitiza: aceita só os campos mínimos
   const sanitized = salesToProcess.map((s) => ({
     id: s.id,
     sku: String(s.sku || '').trim(),
@@ -360,7 +358,6 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
     quantity: Number(s.quantity || 0)
   }));
 
-  // Proteção de tamanho de lote
   if (sanitized.length > MAX_PROCESS_BATCH) {
     return res.status(413).json({
       error: `Lote muito grande. Envie até ${MAX_PROCESS_BATCH} itens por requisição.`
@@ -371,7 +368,6 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
   const client = await db.pool.connect();
 
   try {
-    // Transação por item — permite sucesso parcial
     for (const sale of sanitized) {
       try {
         if (!sale.id || !sale.sku || !sale.uid || !sale.quantity) {
@@ -426,13 +422,11 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         try {
           await client.query('ROLLBACK');
         } catch (e2) {
-          // ignore
         }
         results.failed.push({ saleId: sale.id, sku: sale.sku, reason: e.message });
       }
     }
 
-    // Sempre 200 — mesmo com falhas parciais
     return res.json({ message: 'Processamento concluído.', ...results });
   } catch (error) {
     console.error('Erro crítico no processamento em lote:', error);
@@ -541,17 +535,52 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       return;
     }
 
-    sendEvent(clientId, { progress: 55, message: 'Buscando SLA dos envios...', type: 'info' });
-    const shipments = allOrders.map((o) => o?.shipping?.id || null);
-    const slaResults = await mapWithConcurrency(shipments, SLA_CONCURRENCY, async (shipmentId) => {
-      if (!shipmentId) return null;
-      const res = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/sla`, { headers: { Authorization: `Bearer ${access_token}` } });
-      if (!res.ok) return null;
-      return await res.json();
-    });
-    for (let i = 0; i < allOrders.length; i++) {
-      if (slaResults[i]) allOrders[i].sla_data = slaResults[i];
+    sendEvent(clientId, { progress: 55, message: 'Enriquecendo dados dos envios...', type: 'info' });
+
+    const shipmentIds = [...new Set(allOrders.map(o => o?.shipping?.id).filter(Boolean))];
+    if (shipmentIds.length > 0) {
+        const shipmentDetailsMap = new Map();
+        const BATCH_SIZE = 20;
+
+        for (let i = 0; i < shipmentIds.length; i += BATCH_SIZE) {
+            const batchIds = shipmentIds.slice(i, i + BATCH_SIZE);
+            try {
+                const res = await fetch(`https://api.mercadolibre.com/shipments?shipment_ids=${batchIds.join(',')}`, { headers: { Authorization: `Bearer ${access_token}` } });
+                if (res.ok) {
+                    const shipmentsData = await safeJson(res);
+                    if (Array.isArray(shipmentsData)) {
+                        shipmentsData.forEach(shipment => shipmentDetailsMap.set(shipment.id, shipment));
+                    }
+                }
+            } catch (e) {
+                console.error(`Falha ao buscar lote de envios:`, e);
+            }
+        }
+
+        allOrders.forEach(order => {
+            if (order?.shipping?.id && shipmentDetailsMap.has(order.shipping.id)) {
+                const shipmentDetails = shipmentDetailsMap.get(order.shipping.id);
+                if (shipmentDetails) {
+                    order.shipping = { ...order.shipping, ...shipmentDetails };
+                }
+            }
+        });
     }
+
+    await mapWithConcurrency(allOrders, SLA_CONCURRENCY, async (order) => {
+        const shipmentId = order?.shipping?.id;
+        if (!shipmentId || order.sla_data) return;
+
+        try {
+            const res = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/sla`, { headers: { Authorization: `Bearer ${access_token}` } });
+            if (res.ok) {
+                const slaData = await safeJson(res);
+                if (slaData) order.sla_data = slaData;
+            }
+        } catch (e) {
+            console.error(`Falha ao buscar SLA para envio ${shipmentId}:`, e);
+        }
+    });
 
     const allRows = buildInsertBatchRows(allOrders, requesterUid, nickname);
 
