@@ -2,6 +2,7 @@ const express = require('express');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
 const db = require('../utils/postgres');
+const { authenticateToken } = require('../utils/authMiddleware');
 const router = express.Router();
 
 const REDIRECT_URI = 'https://cyberdock-backend.onrender.com/api/ml/callback';
@@ -43,8 +44,6 @@ router.get('/auth', (req, res) => {
   const finalClientId = client_id || CLIENT_ID;
   const finalRedirectUri = redirect_uri || getRedirectUri();
 
-  console.log(`[ML] Iniciando autenticação para UID: ${uid}. Redirecionando para: ${finalRedirectUri}`);
-
   const authUrl = `https://auth.mercadolibre.com/authorization` +
     `?response_type=code` +
     `&client_id=${finalClientId}` +
@@ -70,7 +69,6 @@ router.get('/callback', async (req, res) => {
   codeVerifiers.delete(state);
 
   const redirectUri = getRedirectUri();
-  console.log(`[ML] Callback recebido. Trocando código por token com redirect_uri: ${redirectUri}`);
 
   try {
     const tokenResponse = await fetch('https://api.mercadolibre.com/oauth/token', {
@@ -91,7 +89,6 @@ router.get('/callback', async (req, res) => {
 
     if (!tokenResponse.ok) {
       const errorBody = await tokenResponse.json().catch(() => ({}));
-      console.error('[ML] Erro ao obter token:', errorBody);
       throw new Error(errorBody.message || 'Falha ao obter token de acesso.');
     }
 
@@ -121,11 +118,9 @@ router.get('/callback', async (req, res) => {
       tokenData.refresh_token, tokenData.expires_in
     ]);
 
-    console.log(`✅ [ML] Conta ${userData.nickname} (ID: ${userData.id}) conectada para UID: ${uid}`);
     res.redirect(`${FRONTEND_URL}/contas?success=${encodeURIComponent(`Conta ${userData.nickname} conectada com sucesso!`)}`);
 
   } catch (error) {
-    console.error('❌ [ML] Erro no callback:', error);
     res.redirect(`${FRONTEND_URL}/contas?error=${encodeURIComponent(error.message || 'Erro desconhecido durante a conexão.')}`);
   }
 });
@@ -172,7 +167,6 @@ router.post('/refresh-token', async (req, res) => {
     res.json({ message: 'Token atualizado com sucesso!' });
 
   } catch (error) {
-    console.error('[ML] Erro ao atualizar token:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -186,23 +180,31 @@ router.get('/contas/:uid', async (req, res) => {
     );
     res.json(rows);
   } catch (error) {
-    console.error('[ML] Erro ao buscar contas:', error.message);
     res.status(500).json({ error: 'Erro interno do servidor.' });
   }
 });
 
-router.delete('/contas/:id', async (req, res) => {
-  const { id } = req.params;
-  const { uid } = req.query;
+router.delete('/contas/:mlUserId', authenticateToken, async (req, res) => {
+  const { mlUserId } = req.params;
+  const { uid } = req.user;
+
+  if (!mlUserId || !uid) {
+    return res.status(400).json({ error: 'Parâmetros inválidos para exclusão.' });
+  }
+
   try {
-    await db.query(
+    const result = await db.query(
       'DELETE FROM public.ml_accounts WHERE user_id = $1 AND uid = $2',
-      [id, uid]
+      [mlUserId, uid]
     );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Conta não encontrada ou não pertence a este usuário.' });
+    }
+
     res.status(204).send();
   } catch (error) {
-    console.error('[ML] Erro ao excluir conta:', error.message);
-    res.status(500).json({ error: 'Erro interno do servidor.' });
+    res.status(500).json({ error: 'Erro interno ao excluir a conta.' });
   }
 });
 
