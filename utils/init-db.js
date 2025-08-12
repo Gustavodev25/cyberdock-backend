@@ -25,6 +25,7 @@ const schema = {
             name VARCHAR(255),
             role VARCHAR(50) NOT NULL DEFAULT 'cliente',
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE,
             password_hash VARCHAR(255)
         );`,
     ml_accounts: `
@@ -100,11 +101,11 @@ const schema = {
             start_date DATE NOT NULL,
             CONSTRAINT unique_contract UNIQUE (uid, service_id)
         );`,
-    user_settings: `
-        CREATE TABLE public.user_settings (
-            uid VARCHAR(255) PRIMARY KEY REFERENCES public.users(uid) ON DELETE CASCADE,
+    user_statuses: `
+        CREATE TABLE public.user_statuses (
+            user_id VARCHAR(255) PRIMARY KEY REFERENCES public.users(uid) ON DELETE CASCADE,
             statuses JSONB,
-            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP WITH TIME ZONE
         );`,
     invoices: `
         CREATE TABLE public.invoices (
@@ -140,7 +141,7 @@ async function syncDatabaseSchema() {
         
         const tablesInOrder = [
             'users', 'package_types', 'services', 'ml_accounts', 'system_settings',
-            'user_settings', 'user_contracts', 'skus', 'sales', 'stock_movements',
+            'user_statuses', 'user_contracts', 'skus', 'sales', 'stock_movements',
             'invoices', 'invoice_items'
         ];
 
@@ -150,11 +151,19 @@ async function syncDatabaseSchema() {
                 console.log(`   -> Criando tabela: public.${tableName}`);
                 await client.query(schema[tableName]);
             } else {
+                // Lógica de migração para tabelas existentes
                 if (tableName === 'users') {
-                    const colRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'name'`);
-                    if (colRes.rowCount === 0) {
+                    // Verifica e adiciona a coluna 'name' se não existir
+                    const nameColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'name'`);
+                    if (nameColRes.rowCount === 0) {
                         console.log(`   -> Adicionando coluna 'name' à tabela: public.users`);
                         await client.query('ALTER TABLE public.users ADD COLUMN name VARCHAR(255);');
+                    }
+                    // Verifica e adiciona a coluna 'updated_at' se não existir
+                    const updatedAtColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'updated_at'`);
+                    if (updatedAtColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'updated_at' à tabela: public.users`);
+                        await client.query('ALTER TABLE public.users ADD COLUMN updated_at TIMESTAMP WITH TIME ZONE;');
                     }
                 }
                  if (tableName === 'services') {

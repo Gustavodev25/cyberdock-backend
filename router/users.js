@@ -1,129 +1,154 @@
-// backend/router/users.js
-
+// backend/routes/users.js
 const express = require('express');
 const db = require('../utils/postgres');
-// Importa os middlewares centralizados
 const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
 
 const router = express.Router();
 
-// --- Rota para listar todos os usuários (apenas masters) ---
-// ATUALIZADO: Agora inclui o apelido do Mercado Livre
+/**
+ * @route   GET /api/users/all
+ * @desc    Busca todos os usuários. Adiciona o nickname da primeira conta ML associada.
+ * @access  Private (Master)
+ */
 router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     try {
-        // Query com LEFT JOIN para buscar o apelido mais recente da conta ML
-        const usersQuery = `
+        const query = `
             SELECT
                 u.uid,
                 u.email,
                 u.role,
                 u.created_at,
-                ma.nickname AS "mlNickname"
+                (SELECT nickname FROM public.ml_accounts WHERE uid = u.uid ORDER BY created_at ASC LIMIT 1) as "mlNickname"
             FROM
                 public.users u
-            LEFT JOIN (
-                SELECT
-                    uid,
-                    nickname,
-                    ROW_NUMBER() OVER(PARTITION BY uid ORDER BY connected_at DESC) as rn
-                FROM
-                    public.ml_accounts
-            ) ma ON u.uid = ma.uid AND ma.rn = 1
             ORDER BY
                 u.created_at DESC;
         `;
-        const { rows } = await db.query(usersQuery);
-        
-        // O mapeamento agora já inclui o mlNickname, se existir
-        const formattedUsers = rows.map(user => ({
-            uid: user.uid,
-            email: user.email,
-            role: user.role,
-            createdAt: user.created_at,
-            mlNickname: user.mlNickname // Este campo vem direto do DB
-        }));
-
-        res.json(formattedUsers);
+        const { rows } = await db.query(query);
+        res.json(rows);
     } catch (error) {
-        console.error('Erro ao buscar usuários:', error);
+        console.error("Erro ao buscar usuários:", error);
         res.status(500).json({ error: 'Erro interno ao buscar usuários.' });
     }
 });
 
-// --- [CORRIGIDO] Rota para buscar status personalizados de um usuário ---
-router.get('/statuses/:uid', authenticateToken, requireMaster, async (req, res) => {
+/**
+ * @route   PUT /api/users/:uid/role
+ * @desc    Atualiza a permissão (role) de um usuário.
+ * @access  Private (Master)
+ */
+router.put('/:uid/role', authenticateToken, requireMaster, async (req, res) => {
+    const { uid } = req.params;
+    const { role } = req.body;
+
+    if (!['cliente', 'master'].includes(role)) {
+        return res.status(400).json({ error: 'Permissão inválida. Use "cliente" ou "master".' });
+    }
+
+    try {
+        const { rows } = await db.query(
+            'UPDATE public.users SET role = $1, updated_at = NOW() WHERE uid = $2 RETURNING uid, role',
+            [role, uid]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Usuário não encontrado.' });
+        }
+
+        res.json({ message: 'Permissão atualizada com sucesso.', user: rows[0] });
+    } catch (error) {
+        console.error(`Erro ao atualizar permissão para o usuário ${uid}:`, error);
+        res.status(500).json({ error: 'Erro interno ao atualizar permissão.' });
+    }
+});
+
+/**
+ * @route   DELETE /api/users/:uid
+ * @desc    Exclui um usuário e seus dados relacionados.
+ * @access  Private (Master)
+ */
+router.delete('/:uid', authenticateToken, requireMaster, async (req, res) => {
     const { uid } = req.params;
     const client = await db.pool.connect();
+
     try {
-        // Tenta buscar os status específicos do usuário
-        let userStatusesResult = await client.query('SELECT statuses FROM public.user_settings WHERE uid = $1', [uid]);
+        await client.query('BEGIN');
 
-        if (userStatusesResult.rows.length > 0 && userStatusesResult.rows[0].statuses) {
-            // Se o usuário já tem status salvos, retorna eles
-            return res.json({ statuses: userStatusesResult.rows[0].statuses });
+        await client.query('DELETE FROM public.ml_accounts WHERE uid = $1', [uid]);
+        await client.query('DELETE FROM public.sales WHERE uid = $1', [uid]);
+        await client.query('DELETE FROM public.skus WHERE user_id = $1', [uid]);
+        await client.query('DELETE FROM public.stock_movements WHERE user_id = $1', [uid]);
+        await client.query('DELETE FROM public.user_contracts WHERE uid = $1', [uid]);
+        await client.query('DELETE FROM public.user_statuses WHERE user_id = $1', [uid]);
+
+        const deleteUserResult = await client.query('DELETE FROM public.users WHERE uid = $1 RETURNING uid', [uid]);
+
+        if (deleteUserResult.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Usuário não encontrado.' });
         }
 
-        // Se o usuário não tem status, busca os padrões do sistema
-        console.log(`Nenhum status encontrado para o usuário ${uid}. Buscando padrões do sistema.`);
-        const defaultStatusesResult = await client.query("SELECT value FROM public.system_settings WHERE key = 'sales_statuses'");
-
-        if (defaultStatusesResult.rows.length === 0) {
-            // Se nem os padrões existem, retorna um array vazio
-            console.warn('Configuração de status padrão ("sales_statuses") não encontrada em system_settings.');
-            return res.json({ statuses: [] });
-        }
-
-        const defaultStatuses = defaultStatusesResult.rows[0].value;
-
-        // [LAZY-SEEDING] Salva os status padrão para o usuário para futuras edições
-        console.log(`Salvando status padrão para o usuário ${uid}.`);
-        const upsertQuery = `
-            INSERT INTO public.user_settings (uid, statuses, updated_at)
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (uid)
-            DO UPDATE SET statuses = EXCLUDED.statuses, updated_at = NOW();
-        `;
-        await client.query(upsertQuery, [uid, JSON.stringify(defaultStatuses)]);
-
-        // Retorna os status padrão que acabaram de ser salvos
-        res.json({ statuses: defaultStatuses });
+        await client.query('COMMIT');
+        res.status(200).json({ message: `Usuário ${uid} excluído com sucesso.` });
 
     } catch (error) {
-        console.error('Erro ao buscar status do usuário:', error);
-        res.status(500).json({ error: 'Erro interno ao buscar status.' });
+        await client.query('ROLLBACK');
+        console.error(`Erro ao excluir usuário ${uid}:`, error);
+        res.status(500).json({ error: 'Erro interno ao excluir o usuário.' });
     } finally {
         client.release();
     }
 });
 
 
-// --- Rota para salvar status personalizados de um usuário ---
+/**
+ * @route   GET /api/users/statuses/:uid
+ * @desc    Busca os status de venda personalizados de um usuário.
+ * @access  Private (Master)
+ */
+router.get('/statuses/:uid', authenticateToken, requireMaster, async (req, res) => {
+    const { uid } = req.params;
+    try {
+        const { rows } = await db.query("SELECT statuses FROM public.user_statuses WHERE user_id = $1", [uid]);
+        if (rows.length === 0) {
+            return res.json({ statuses: [] });
+        }
+        res.json({ statuses: rows[0].statuses || [] });
+    } catch (error) {
+        console.error('Erro ao buscar status do usuário:', error);
+        res.status(500).json({ error: 'Erro interno do servidor.' });
+    }
+});
+
+/**
+ * @route   PUT /api/users/statuses/:uid
+ * @desc    Atualiza (ou cria) a lista de status de um usuário.
+ * @access  Private (Master)
+ */
 router.put('/statuses/:uid', authenticateToken, requireMaster, async (req, res) => {
     const { uid } = req.params;
     const { statuses } = req.body;
 
-    if (!Array.isArray(statuses)) {
-        return res.status(400).json({ error: 'Lista de status é obrigatória e deve ser um array.' });
+    if (!statuses || !Array.isArray(statuses)) {
+        return res.status(400).json({ error: 'Formato de status inválido.' });
     }
 
     try {
-        const upsertQuery = `
-            INSERT INTO public.user_settings (uid, statuses, updated_at) 
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (uid) 
-            DO UPDATE SET statuses = EXCLUDED.statuses, updated_at = NOW()
-            RETURNING uid;
+        const query = `
+            INSERT INTO public.user_statuses (user_id, statuses, updated_at) 
+            VALUES ($1, $2, NOW()) 
+            ON CONFLICT (user_id) 
+            DO UPDATE SET statuses = $2, updated_at = NOW();
         `;
-        const { rows } = await db.query(upsertQuery, [uid, JSON.stringify(statuses)]);
-        res.json({ message: 'Status salvos com sucesso!', uid: rows[0].uid });
+        await db.query(query, [uid, JSON.stringify(statuses)]);
+        res.json({ message: 'Status do usuário atualizados com sucesso.' });
     } catch (error) {
         console.error('Erro ao salvar status do usuário:', error);
-        res.status(500).json({ error: 'Erro interno ao salvar status.' });
+        res.status(500).json({ error: 'Erro interno do servidor.' });
     }
 });
 
-
-// --- ROTAS PARA GERENCIAR SERVIÇOS CONTRATADOS (CONTRATOS) ---
+// --- NOVAS ROTAS PARA GERENCIAR CONTRATOS ---
 
 /**
  * @route   GET /api/users/contracts/:uid
@@ -134,14 +159,20 @@ router.get('/contracts/:uid', authenticateToken, requireMaster, async (req, res)
     const { uid } = req.params;
     try {
         const query = `
-            SELECT id, uid, service_id, name, price, volume, start_date
-            FROM public.user_contracts
-            WHERE uid = $1
-            ORDER BY start_date DESC;
+            SELECT
+                uc.id,
+                uc.uid,
+                uc.service_id AS "serviceId",
+                uc.name,
+                uc.price,
+                uc.volume,
+                uc.start_date AS "startDate"
+            FROM public.user_contracts uc
+            WHERE uc.uid = $1
+            ORDER BY uc.start_date DESC;
         `;
         const { rows } = await db.query(query, [uid]);
-        const formattedRows = rows.map(c => ({ ...c, price: parseFloat(c.price) }));
-        res.json({ contracts: formattedRows });
+        res.json({ contracts: rows });
     } catch (error) {
         console.error(`Erro ao buscar contratos para o usuário ${uid}:`, error);
         res.status(500).json({ error: 'Erro interno ao buscar contratos.' });
@@ -150,7 +181,7 @@ router.get('/contracts/:uid', authenticateToken, requireMaster, async (req, res)
 
 /**
  * @route   POST /api/users/contracts/:uid
- * @desc    Adiciona um novo serviço (contrato) para um usuário.
+ * @desc    Adiciona um novo serviço contratado para um usuário.
  * @access  Private (Master)
  */
 router.post('/contracts/:uid', authenticateToken, requireMaster, async (req, res) => {
@@ -158,7 +189,7 @@ router.post('/contracts/:uid', authenticateToken, requireMaster, async (req, res
     const { serviceId, name, price, volume, startDate } = req.body;
 
     if (!serviceId || !name || price == null || !startDate) {
-        return res.status(400).json({ error: 'Dados incompletos. serviceId, name, price e startDate são obrigatórios.' });
+        return res.status(400).json({ error: 'Dados do contrato incompletos.' });
     }
 
     try {
@@ -168,15 +199,12 @@ router.post('/contracts/:uid', authenticateToken, requireMaster, async (req, res
             RETURNING *;
         `;
         const { rows } = await db.query(query, [uid, serviceId, name, price, volume, startDate]);
-        res.status(201).json({ message: 'Contrato adicionado com sucesso.', contract: rows[0] });
+        res.status(201).json({ message: 'Serviço contratado com sucesso!', contract: rows[0] });
     } catch (error) {
-        console.error(`Erro ao adicionar contrato para o usuário ${uid}:`, error);
-        if (error.code === '23505') { // unique_violation
+        if (error.code === '23505') { // unique_contract violation
             return res.status(409).json({ error: 'Este serviço já foi contratado por este usuário.' });
         }
-        if (error.code === '23503') { // foreign_key_violation
-            return res.status(404).json({ error: 'Usuário ou serviço do catálogo não encontrado.' });
-        }
+        console.error(`Erro ao adicionar contrato para o usuário ${uid}:`, error);
         res.status(500).json({ error: 'Erro interno ao adicionar contrato.' });
     }
 });
@@ -188,23 +216,23 @@ router.post('/contracts/:uid', authenticateToken, requireMaster, async (req, res
  */
 router.delete('/contracts/:uid/:contractId', authenticateToken, requireMaster, async (req, res) => {
     const { uid, contractId } = req.params;
+
     try {
-        const query = `
-            DELETE FROM public.user_contracts
-            WHERE id = $1 AND uid = $2
-            RETURNING id;
-        `;
-        const { rowCount } = await db.query(query, [contractId, uid]);
+        const { rowCount } = await db.query(
+            'DELETE FROM public.user_contracts WHERE uid = $1 AND id = $2',
+            [uid, contractId]
+        );
 
         if (rowCount === 0) {
-            return res.status(404).json({ error: 'Contrato não encontrado ou não pertence a este usuário.' });
+            return res.status(404).json({ error: 'Contrato não encontrado para este usuário.' });
         }
 
-        res.status(200).json({ message: 'Contrato removido com sucesso.' });
+        res.status(200).json({ message: 'Serviço contratado removido com sucesso.' });
     } catch (error) {
-        console.error(`Erro ao remover o contrato ${contractId} do usuário ${uid}:`, error);
+        console.error(`Erro ao remover contrato ${contractId} do usuário ${uid}:`, error);
         res.status(500).json({ error: 'Erro interno ao remover contrato.' });
     }
 });
+
 
 module.exports = router;

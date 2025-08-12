@@ -9,6 +9,7 @@ const settingsRouter = require('./settings');
 const servicesRouter = require('./services');
 const storageRouter = require('./storage');
 const billingRouter = require('./billing');
+const historyRoutes = require('./history');
 
 router.get('/', (req, res) => {
   res.send('API Cyberdock backend rodando.');
@@ -22,5 +23,6 @@ router.use('/settings', settingsRouter);
 router.use('/services', servicesRouter);
 router.use('/storage', storageRouter);
 router.use('/billing', billingRouter);
+router.use('/history', historyRoutes);
 
 module.exports = router;
