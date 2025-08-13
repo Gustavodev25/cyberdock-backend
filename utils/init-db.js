@@ -55,7 +55,7 @@ const schema = {
             shipping_mode VARCHAR(255),
             shipping_limit_date TIMESTAMP WITH TIME ZONE,
             packages INTEGER,
-            shipping_status VARCHAR(100) DEFAULT 'pending',
+            shipping_status VARCHAR(100) DEFAULT 'Pendente',
             raw_api_data JSONB,
             updated_at TIMESTAMP WITH TIME ZONE,
             processed_at TIMESTAMP WITH TIME ZONE

@@ -1,3 +1,4 @@
+// routes/sales.js
 const express = require('express');
 const db = require('../utils/postgres');
 const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
@@ -56,7 +57,7 @@ async function mapWithConcurrency(items, limit, mapper) {
   });
 }
 
-function buildInsertBatchRows(orders, requesterUid, nickname) {
+function buildInsertBatchRows(orders, targetUid, nickname) {
   const rows = [];
   for (const order of orders) {
     const slaData = order?.sla_data || null;
@@ -67,37 +68,34 @@ function buildInsertBatchRows(orders, requesterUid, nickname) {
 
     let shippingMode = order?.shipping?.logistic_type || order?.shipping?.mode;
     if (!shippingMode && Array.isArray(order.tags)) {
-        if (order.tags.includes('fulfillment') || order.tags.includes('pack_order')) {
-            shippingMode = 'fulfillment';
-        }
+      if (order.tags.includes('fulfillment') || order.tags.includes('pack_order')) {
+        shippingMode = 'fulfillment';
+      }
     }
 
-    const translateMode = (mode) => {
-        if (!mode) return 'A verificar';
-        switch (String(mode).toLowerCase()) {
-            case 'fulfillment':
-                return 'Envio Full';
-            case 'cross_docking':
-                return 'Cross-Docking';
-            case 'drop_off':
-                return 'Ponto de Coleta';
-            case 'self_service':
-                return 'Agência ML';
-            default:
-                return mode;
-        }
+    const mapShippingType = (mode) => {
+      if (!mode) return 'Outros';
+      switch (String(mode).toLowerCase()) {
+        case 'fulfillment': return 'FULL';
+        case 'self_service': return 'FLEX';
+        case 'drop_off': return 'Correios';
+        case 'xd_drop_off': return 'Agência';
+        case 'cross_docking': return 'Coleta';
+        case 'me2': return 'Envio Padrão';
+        default: return 'Outros';
+      }
     };
 
-    const finalShippingMode = translateMode(shippingMode);
+    const finalShippingMode = mapShippingType(shippingMode);
 
     for (const it of order?.order_items || []) {
-      const sku = it?.item?.seller_sku;
+      const sku = it?.item?.seller_sku || it?.item?.id || null;
       if (!sku) continue;
 
       rows.push({
         id: order.id,
         sku,
-        uid: requesterUid,
+        uid: targetUid,
         seller_id: order?.seller?.id,
         channel: 'ML',
         account_nickname: nickname || null,
@@ -107,7 +105,6 @@ function buildInsertBatchRows(orders, requesterUid, nickname) {
         shipping_mode: finalShippingMode,
         shipping_limit_date: finalShippingLimitDate,
         packages: order.pack_id ? 1 : 0,
-        shipping_status: order?.shipping?.status || null,
         raw_api_data: order
       });
     }
@@ -115,23 +112,11 @@ function buildInsertBatchRows(orders, requesterUid, nickname) {
   return rows;
 }
 
-function buildMultiInsertQuery_DoNothing(rows) {
+function buildMultiInsertQuery_DoUpdate(rows) {
   const cols = [
-    'id',
-    'sku',
-    'uid',
-    'seller_id',
-    'channel',
-    'account_nickname',
-    'sale_date',
-    'product_title',
-    'quantity',
-    'shipping_mode',
-    'shipping_limit_date',
-    'packages',
-    'shipping_status',
-    'raw_api_data',
-    'updated_at'
+    'id', 'sku', 'uid', 'seller_id', 'channel', 'account_nickname',
+    'sale_date', 'product_title', 'quantity', 'shipping_mode',
+    'shipping_limit_date', 'packages', 'raw_api_data', 'updated_at'
   ];
   const values = [];
   const params = [];
@@ -139,20 +124,9 @@ function buildMultiInsertQuery_DoNothing(rows) {
 
   for (const r of rows) {
     params.push(
-      r.id,
-      r.sku,
-      r.uid,
-      r.seller_id,
-      'ML',
-      r.account_nickname,
-      r.sale_date,
-      r.product_title,
-      r.quantity,
-      r.shipping_mode,
-      r.shipping_limit_date,
-      r.packages,
-      r.shipping_status,
-      r.raw_api_data,
+      r.id, r.sku, r.uid, r.seller_id, 'ML', r.account_nickname,
+      r.sale_date, r.product_title, r.quantity, r.shipping_mode,
+      r.shipping_limit_date, r.packages, r.raw_api_data,
       new Date()
     );
     const placeholders = cols.map(() => `$${p++}`).join(', ');
@@ -162,11 +136,185 @@ function buildMultiInsertQuery_DoNothing(rows) {
   const query = `
     INSERT INTO public.sales (${cols.join(', ')})
     VALUES ${values.join(', ')}
-    ON CONFLICT (id, sku, uid) DO NOTHING;
+    ON CONFLICT (id, sku, uid) DO UPDATE SET
+      shipping_mode = EXCLUDED.shipping_mode,
+      shipping_limit_date = EXCLUDED.shipping_limit_date,
+      packages = EXCLUDED.packages,
+      raw_api_data = EXCLUDED.raw_api_data,
+      updated_at = EXCLUDED.updated_at
+    WHERE public.sales.processed_at IS NULL;
   `;
 
   return { query, params };
 }
+
+/** ======== HELPERS PARA BACKFILL ======== */
+
+function uniqByIdSku(rows) {
+  const seen = new Set();
+  const out = [];
+  for (const r of rows) {
+    const k = `${r.id}::${r.sku}::${r.uid}`;
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(r);
+    }
+  }
+  return out;
+}
+
+// Atualiza em lote somente campos de enriquecimento sem tocar em processed_at
+function buildMultiUpdateQuery_Backfill(rows) {
+  // rows: [{ id, sku, uid, shipping_mode, shipping_limit_date, packages, raw_api_data }]
+  const cols = ['id', 'sku', 'uid', 'shipping_mode', 'shipping_limit_date', 'packages', 'raw_api_data', 'updated_at'];
+  const values = [];
+  const params = [];
+  let p = 1;
+
+  for (const r of rows) {
+    params.push(
+      r.id, r.sku, r.uid,
+      r.shipping_mode ?? null,
+      r.shipping_limit_date ?? null,
+      r.packages ?? null,
+      r.raw_api_data ?? null,
+      new Date()
+    );
+    const placeholders = cols.map(() => `$${p++}`).join(', ');
+    values.push(`(${placeholders})`);
+  }
+
+  const query = `
+    WITH data (${cols.join(', ')}) AS (
+      VALUES ${values.join(', ')}
+    )
+    UPDATE public.sales s
+       SET shipping_mode = CASE 
+                              WHEN s.shipping_mode IS NULL OR s.shipping_mode = 'Outros'
+                              THEN d.shipping_mode
+                              ELSE s.shipping_mode
+                           END,
+           shipping_limit_date = COALESCE(s.shipping_limit_date, d.shipping_limit_date),
+           packages           = COALESCE(s.packages, d.packages),
+           raw_api_data       = COALESCE(d.raw_api_data, s.raw_api_data),
+           updated_at         = GREATEST(COALESCE(s.updated_at, d.updated_at), d.updated_at)
+      FROM data d
+     WHERE s.id = d.id
+       AND s.sku = d.sku
+       AND s.uid = d.uid;
+  `;
+  return { query, params };
+}
+
+// Passo de backfill: escaneia vendas salvas com dados faltantes e preenche
+async function runBackfillMissing({ db, clientId, nickname, targetUid, userId, access_token }) {
+  sendEvent(clientId, { progress: 40, message: `[${nickname}] Procurando vendas com dados faltantes...`, type: 'info' });
+
+  const candidatesQ = `
+    SELECT id, sku, uid, seller_id, account_nickname, sale_date
+      FROM public.sales
+     WHERE uid = $1
+       AND seller_id = $2
+       AND (
+         raw_api_data IS NULL
+         OR raw_api_data->'shipping' IS NULL
+         OR raw_api_data->'sla_data' IS NULL
+         OR shipping_mode IS NULL
+         OR shipping_mode = 'Outros'
+         OR shipping_limit_date IS NULL
+       )
+     ORDER BY sale_date DESC
+     LIMIT $3;
+  `;
+  const cand = await db.query(candidatesQ, [targetUid, userId, MAX_ORDERS]);
+
+  if (cand.rowCount === 0) {
+    sendEvent(clientId, { progress: 55, message: `[${nickname}] Nada para completar. Nenhum dado faltante.`, type: 'success' });
+    return;
+  }
+
+  const byOrder = {};
+  for (const r of cand.rows) {
+    if (!byOrder[r.id]) byOrder[r.id] = [];
+    byOrder[r.id].push(r.sku);
+  }
+  const orderIds = Object.keys(byOrder);
+
+  sendEvent(clientId, { progress: 50, message: `[${nickname}] Enriquecendo ${orderIds.length} pedidos salvos...`, type: 'info' });
+
+  // 1) Detalhes do pedido + shipments + sla
+  const detailedOrders = await mapWithConcurrency(orderIds, SLA_CONCURRENCY, async (orderId, idx) => {
+    try {
+      const r = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
+        headers: { Authorization: `Bearer ${access_token}` }
+      });
+      let order = r.ok ? await r.json() : null;
+
+      if (order?.shipping?.id) {
+        const shipId = order.shipping.id;
+        const [shipRes, slaRes] = await Promise.all([
+          fetch(`https://api.mercadolibre.com/shipments/${shipId}`, { headers: { Authorization: `Bearer ${access_token}` } }),
+          fetch(`https://api.mercadolibre.com/shipments/${shipId}/sla`, { headers: { Authorization: `Bearer ${access_token}` } }),
+        ]);
+
+        if (shipRes.ok) {
+          const ship = await safeJson(shipRes);
+          order.shipping = { ...order.shipping, ...ship };
+        }
+        if (slaRes.ok) {
+          order.sla_data = await safeJson(slaRes);
+        }
+      }
+
+      if (idx > 0 && idx % 10 === 0) {
+        const pct = 50 + Math.floor(((idx + 1) / orderIds.length) * 20);
+        sendEvent(clientId, { progress: Math.min(70, pct), message: `[${nickname}] Backfill... ${idx + 1}/${orderIds.length}`, type: 'info' });
+      }
+      return order;
+    } catch {
+      return null;
+    }
+  });
+
+  // 2) Linhas apenas para (id, sku, uid) já existentes
+  const allowed = new Set(cand.rows.map(r => `${r.id}::${r.sku}::${r.uid}`));
+  const rowsRaw = buildInsertBatchRows(detailedOrders.filter(Boolean), targetUid, nickname)
+    .filter(r => allowed.has(`${r.id}::${r.sku}::${r.uid}`));
+  const rows = uniqByIdSku(rowsRaw);
+
+  if (rows.length === 0) {
+    sendEvent(clientId, { progress: 72, message: `[${nickname}] Nada a atualizar após o enriquecimento.`, type: 'info' });
+    return;
+  }
+
+  sendEvent(clientId, { progress: 72, message: `[${nickname}] Atualizando ${rows.length} itens existentes...`, type: 'info' });
+
+  const clientDb = await db.pool.connect();
+  try {
+    await clientDb.query('BEGIN');
+
+    for (let i = 0; i < rows.length; i += UPSERT_BATCH_SIZE) {
+      const chunk = rows.slice(i, i + UPSERT_BATCH_SIZE);
+      const { query, params } = buildMultiUpdateQuery_Backfill(chunk);
+      await clientDb.query(query, params);
+
+      const pct = 72 + Math.floor(((i + chunk.length) / rows.length) * 13);
+      if (i === 0 || i + UPSERT_BATCH_SIZE >= rows.length || i % (UPSERT_BATCH_SIZE * 3) === 0) {
+        sendEvent(clientId, { progress: Math.min(85, pct), message: `[${nickname}] Backfill em lote... ${i + chunk.length}/${rows.length}`, type: 'info' });
+      }
+    }
+
+    await clientDb.query('COMMIT');
+    sendEvent(clientId, { progress: 88, message: `[${nickname}] Backfill concluído para ${rows.length} itens.`, type: 'success' });
+  } catch (e) {
+    await clientDb.query('ROLLBACK');
+    throw e;
+  } finally {
+    clientDb.release();
+  }
+}
+
+/** ======== ROTAS ======== */
 
 router.get('/sync-status/:clientId', (req, res) => {
   const { clientId } = req.params;
@@ -316,10 +464,7 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
       await client.query('COMMIT');
       return res.json({ message: 'Status atualizado e estoque abatido.', sale: rows[0] });
     } catch (err) {
-      try {
-        await client.query('ROLLBACK');
-      } catch (e) {
-      }
+      try { await client.query('ROLLBACK'); } catch (e) { /* ignore */ }
       return res.status(400).json({ error: err.message || 'Erro interno ao processar despacho.' });
     } finally {
       client.release();
@@ -419,10 +564,7 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         await client.query('COMMIT');
         results.success.push({ saleId: sale.id, sku: sale.sku });
       } catch (e) {
-        try {
-          await client.query('ROLLBACK');
-        } catch (e2) {
-        }
+        try { await client.query('ROLLBACK'); } catch (e2) { /* ignore */ }
         results.failed.push({ saleId: sale.id, sku: sale.sku, reason: e.message });
       }
     }
@@ -437,47 +579,62 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
 });
 
 router.post('/sync-account', authenticateToken, async (req, res) => {
-  const { userId, accountNickname: nickname, clientId } = req.body;
-  const requesterUid = req.user.uid;
+  const { userId, accountNickname: nickname, clientId, force, backfill, clientUid } = req.body;
+  const masterUid = req.user.uid;
+  const targetUid = clientUid || masterUid;
 
   if (!userId || !clientId) return res.status(400).json({ error: 'ID usuário e clientId obrigatórios.' });
 
   res.status(202).json({ message: 'Sincronização iniciada. Acompanhe status.' });
 
   try {
-    sendEvent(clientId, { progress: 10, message: 'Buscando credenciais...', type: 'info' });
+    sendEvent(clientId, { progress: 10, message: `[${nickname}] Buscando credenciais...`, type: 'info' });
     const accQ = 'SELECT access_token, refresh_token FROM public.ml_accounts WHERE user_id = $1 AND uid = $2';
-    const accRes = await db.query(accQ, [userId, requesterUid]);
+    const accRes = await db.query(accQ, [userId, targetUid]);
     if (accRes.rowCount === 0) throw new Error('Conta ML não encontrada ou não pertence ao usuário.');
     let { access_token, refresh_token } = accRes.rows[0];
 
-    const lastSyncRes = await db.query(
-      `SELECT MAX(sale_date) AS last_sale
-         FROM public.sales
-        WHERE uid = $1 AND seller_id = $2`,
-      [requesterUid, userId]
-    );
+    if (backfill) {
+      await runBackfillMissing({ db, clientId, nickname, targetUid, userId, access_token });
+    }
 
-    const lastSyncDate = lastSyncRes.rows[0]?.last_sale ? new Date(lastSyncRes.rows[0].last_sale) : new Date('2025-01-01T00:00:00Z');
+    let lastSyncDate;
+    const maxLookbackDate = new Date();
+    maxLookbackDate.setDate(maxLookbackDate.getDate() - 180);
 
-    let allOrders = [];
+    if (force) {
+      lastSyncDate = maxLookbackDate;
+      sendEvent(clientId, { progress: 15, message: `[${nickname}] Sincronização forçada iniciada...`, type: 'info' });
+    } else {
+      const lastSyncRes = await db.query(
+        `SELECT MAX(sale_date) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
+        [targetUid, userId]
+      );
+      lastSyncDate = lastSyncRes.rows[0]?.last_sale ? new Date(lastSyncRes.rows[0].last_sale) : null;
+
+      if (!lastSyncDate || lastSyncDate < maxLookbackDate) {
+        lastSyncDate = maxLookbackDate;
+      } else {
+        lastSyncDate.setDate(lastSyncDate.getDate() - 1);
+      }
+    }
+
+    sendEvent(clientId, { progress: 20, message: `[${nickname}] Buscando resumo de vendas desde ${lastSyncDate.toLocaleDateString('pt-BR')}...`, type: 'info' });
+
+    let orderSummaries = [];
     let offset = 0;
 
-    sendEvent(clientId, { progress: 20, message: `Buscando vendas após ${lastSyncDate.toISOString()}...`, type: 'info' });
-
-    while (allOrders.length < MAX_ORDERS) {
-      const limit = Math.min(PAGE_LIMIT, MAX_ORDERS - allOrders.length);
+    while (orderSummaries.length < MAX_ORDERS) {
+      const limit = Math.min(PAGE_LIMIT, MAX_ORDERS - orderSummaries.length);
       const ordersUrl =
         `https://api.mercadolibre.com/orders/search` +
-        `?seller=${userId}` +
-        `&offset=${offset}` +
-        `&limit=${limit}` +
-        `&sort=date_desc` +
+        `?seller=${userId}&offset=${offset}&limit=${limit}&sort=date_desc` +
         `&order.date_created.from=${encodeURIComponent(lastSyncDate.toISOString())}`;
 
       let ordersResponse = await fetch(ordersUrl, { headers: { Authorization: `Bearer ${access_token}` } });
 
       if (ordersResponse.status === 401) {
+        sendEvent(clientId, { progress: 25, message: `[${nickname}] Token expirado. Tentando renovar...`, type: 'info' });
         const CLIENT_ID = process.env.ML_CLIENT_ID;
         const CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
         const refreshResponse = await fetch('https://api.mercadolibre.com/oauth/token', {
@@ -491,118 +648,114 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
           })
         });
         if (!refreshResponse.ok) {
-          await db.query("UPDATE public.ml_accounts SET status = 'reconnect_needed' WHERE user_id = $1 AND uid = $2", [userId, requesterUid]);
-          throw new Error('Falha ao atualizar token. Refaça a conexão.');
+          await db.query("UPDATE public.ml_accounts SET status = 'reconnect_needed' WHERE user_id = $1 AND uid = $2", [userId, targetUid]);
+          throw new Error('Falha ao renovar token. É necessário reconectar a conta.');
         }
         const newTokenData = await refreshResponse.json();
         access_token = newTokenData.access_token;
         refresh_token = newTokenData.refresh_token;
         await db.query(
           'UPDATE public.ml_accounts SET access_token = $1, refresh_token = $2, expires_in = $3, status = \'active\', updated_at = NOW() WHERE user_id = $4 AND uid = $5',
-          [access_token, refresh_token, newTokenData.expires_in, userId, requesterUid]
+          [access_token, refresh_token, newTokenData.expires_in, userId, targetUid]
         );
-        sendEvent(clientId, { progress: 40, message: 'Token atualizado. Continuando...', type: 'info' });
+        sendEvent(clientId, { progress: 30, message: `[${nickname}] Token atualizado. Retomando busca...`, type: 'info' });
         ordersResponse = await fetch(ordersUrl, { headers: { Authorization: `Bearer ${access_token}` } });
       }
 
       if (!ordersResponse.ok) {
         const errorBody = await safeJson(ordersResponse);
-        throw new Error(`Erro ao buscar vendas ML: ${errorBody?.message || ordersResponse.statusText}`);
+        throw new Error(`Erro na API do Mercado Livre: ${errorBody?.message || ordersResponse.statusText}`);
       }
 
       const pageData = await ordersResponse.json();
       const items = pageData.results || [];
       if (items.length === 0) break;
 
-      const filteredItems = items.filter((o) => new Date(o.date_created) > lastSyncDate);
-      allOrders.push(...filteredItems);
+      const filteredItems = items.filter((o) => new Date(o.date_created) >= lastSyncDate);
+      orderSummaries.push(...filteredItems);
 
-      const lastDateInPage = new Date(items[items.length - 1]?.date_created);
-      if (lastDateInPage <= lastSyncDate) break;
+      if (items.length > 0) {
+        const lastDateInPage = new Date(items[items.length - 1]?.date_created);
+        if (lastDateInPage < lastSyncDate) break;
+      }
 
       if (items.length < limit) break;
       offset += limit;
-
-      sendEvent(clientId, {
-        progress: 20 + Math.floor((allOrders.length / MAX_ORDERS) * 25),
-        message: `Coletadas ${allOrders.length} novas vendas...`,
-        type: 'info'
-      });
     }
 
-    if (allOrders.length === 0) {
-      sendEvent(clientId, { progress: 100, message: 'Tudo atualizado. Nenhuma venda nova.', type: 'success' });
+    if (orderSummaries.length === 0) {
+      sendEvent(clientId, { progress: 100, message: `[${nickname}] Nenhuma venda nova encontrada. Tudo atualizado!`, type: 'success' });
       return;
     }
 
-    sendEvent(clientId, { progress: 55, message: 'Enriquecendo dados dos envios...', type: 'info' });
-
-    const shipmentIds = [...new Set(allOrders.map(o => o?.shipping?.id).filter(Boolean))];
-    if (shipmentIds.length > 0) {
-        const shipmentDetailsMap = new Map();
-        const BATCH_SIZE = 20;
-
-        for (let i = 0; i < shipmentIds.length; i += BATCH_SIZE) {
-            const batchIds = shipmentIds.slice(i, i + BATCH_SIZE);
-            try {
-                const res = await fetch(`https://api.mercadolibre.com/shipments?shipment_ids=${batchIds.join(',')}`, { headers: { Authorization: `Bearer ${access_token}` } });
-                if (res.ok) {
-                    const shipmentsData = await safeJson(res);
-                    if (Array.isArray(shipmentsData)) {
-                        shipmentsData.forEach(shipment => shipmentDetailsMap.set(shipment.id, shipment));
-                    }
-                }
-            } catch (e) {
-                console.error(`Falha ao buscar lote de envios:`, e);
-            }
+    sendEvent(clientId, { progress: 45, message: `[${nickname}] Buscando detalhes de ${orderSummaries.length} vendas...`, type: 'info' });
+    const allOrders = await mapWithConcurrency(orderSummaries, SLA_CONCURRENCY, async (order, index) => {
+      try {
+        const orderDetailsRes = await fetch(`https://api.mercadolibre.com/orders/${order.id}`, { headers: { Authorization: `Bearer ${access_token}` } });
+        if (orderDetailsRes.ok) {
+          const orderDetails = await orderDetailsRes.json();
+          if (index > 0 && index % 10 === 0) {
+            const pct = 45 + Math.floor(((index + 1) / orderSummaries.length) * 15);
+            sendEvent(clientId, { progress: Math.min(60, pct), message: `[${nickname}] Detalhando... ${index + 1}/${orderSummaries.length}`, type: 'info' });
+          }
+          return orderDetails;
         }
-
-        allOrders.forEach(order => {
-            if (order?.shipping?.id && shipmentDetailsMap.has(order.shipping.id)) {
-                const shipmentDetails = shipmentDetailsMap.get(order.shipping.id);
-                if (shipmentDetails) {
-                    order.shipping = { ...order.shipping, ...shipmentDetails };
-                }
-            }
-        });
-    }
-
-    await mapWithConcurrency(allOrders, SLA_CONCURRENCY, async (order) => {
-        const shipmentId = order?.shipping?.id;
-        if (!shipmentId || order.sla_data) return;
-
-        try {
-            const res = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/sla`, { headers: { Authorization: `Bearer ${access_token}` } });
-            if (res.ok) {
-                const slaData = await safeJson(res);
-                if (slaData) order.sla_data = slaData;
-            }
-        } catch (e) {
-            console.error(`Falha ao buscar SLA para envio ${shipmentId}:`, e);
-        }
+        return order;
+      } catch (e) {
+        console.error(`Falha ao buscar detalhes do pedido ${order.id}:`, e);
+        return order;
+      }
     });
 
-    const allRows = buildInsertBatchRows(allOrders, requesterUid, nickname);
+    sendEvent(clientId, { progress: 65, message: `[${nickname}] Enriquecendo dados de envio para ${allOrders.length} vendas...`, type: 'info' });
+    const enrichedOrders = await mapWithConcurrency(allOrders, SLA_CONCURRENCY, async (order, index) => {
+      const shipmentId = order?.shipping?.id;
+      if (!shipmentId) return order;
 
-    sendEvent(clientId, { progress: 60, message: `Detectadas ${allRows.length} vendas novas. Salvando...`, type: 'info' });
+      try {
+        const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}`, { headers: { Authorization: `Bearer ${access_token}` } });
+        if (shipmentRes.ok) {
+          const shipmentDetails = await safeJson(shipmentRes);
+          if (shipmentDetails) order.shipping = { ...order.shipping, ...shipmentDetails };
+        }
+
+        const slaRes = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/sla`, { headers: { Authorization: `Bearer ${access_token}` } });
+        if (slaRes.ok) {
+          const slaData = await safeJson(slaRes);
+          if (slaData) order.sla_data = slaData;
+        }
+
+        if (index > 0 && index % 10 === 0) {
+          const pct = 65 + Math.floor(((index + 1) / allOrders.length) * 20);
+          sendEvent(clientId, { progress: Math.min(85, pct), message: `[${nickname}] Enriquecendo... ${index + 1}/${allOrders.length}`, type: 'info' });
+        }
+
+        return order;
+      } catch (e) {
+        console.error(`Falha ao enriquecer dados para envio ${shipmentId}:`, e);
+        return order;
+      }
+    });
+
+    const allRows = buildInsertBatchRows(enrichedOrders.filter(Boolean), targetUid, nickname);
+    sendEvent(clientId, { progress: 85, message: `[${nickname}] Preparando ${allRows.length} itens para salvar...`, type: 'info' });
 
     const clientDb = await db.pool.connect();
-    let insertedCount = 0;
     try {
       await clientDb.query('BEGIN');
       for (let i = 0; i < allRows.length; i += UPSERT_BATCH_SIZE) {
         const chunk = allRows.slice(i, i + UPSERT_BATCH_SIZE);
-        const { query, params } = buildMultiInsertQuery_DoNothing(chunk);
-        await clientDb.query(query, params);
-        insertedCount += chunk.length;
 
-        const pct = 60 + Math.floor((insertedCount / allRows.length) * 40);
+        const { query, params } = buildMultiInsertQuery_DoUpdate(chunk);
+        await clientDb.query(query, params);
+
+        const pct = 85 + Math.floor(((i + chunk.length) / allRows.length) * 15);
         if (i === 0 || i + UPSERT_BATCH_SIZE >= allRows.length || i % (UPSERT_BATCH_SIZE * 3) === 0) {
-          sendEvent(clientId, { progress: Math.min(99, pct), message: `Salvando lote... ${insertedCount}/${allRows.length}`, type: 'info' });
+          sendEvent(clientId, { progress: Math.min(99, pct), message: `[${nickname}] Salvando lote... ${i + chunk.length}/${allRows.length}`, type: 'info' });
         }
       }
       await clientDb.query('COMMIT');
-      sendEvent(clientId, { progress: 100, message: `Sincronização concluída. ${insertedCount} vendas inseridas.`, type: 'success' });
+      sendEvent(clientId, { progress: 100, message: `[${nickname}] Sincronização concluída. ${allRows.length} itens processados.`, type: 'success' });
     } catch (e) {
       await clientDb.query('ROLLBACK');
       throw e;
@@ -610,8 +763,8 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       clientDb.release();
     }
   } catch (error) {
-    console.error(`[SYNC ERROR] Cliente ${clientId}:`, error);
-    sendEvent(clientId, { progress: 100, message: `Erro: ${error.message}`, type: 'error' });
+    console.error(`[SYNC ERROR] Cliente ${clientId} | Conta ${nickname}:`, error);
+    sendEvent(clientId, { progress: 100, message: `Erro em [${nickname}]: ${error.message}`, type: 'error' });
   } finally {
     if (clients[clientId]) {
       clients[clientId].res.end();
