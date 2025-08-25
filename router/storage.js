@@ -199,24 +199,101 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, as
 
 // --- ROTAS DE GERENCIAMENTO DE SKU ---
 
-router.get('/user/:userId/skus', authenticateToken, requireMaster, async (req, res) => {
+// GET /api/storage/user/:userId/available-child-skus - Get SKUs that can be used as kit components
+router.get('/user/:userId/available-child-skus', authenticateToken, async (req, res) => {
     const { userId } = req.params;
+    
+    // Allow masters and the user themselves to access their own data
+    if (req.user.role !== 'master' && req.user.uid !== userId) {
+        return res.status(403).json({ error: 'Acesso negado.' });
+    }
+    try {
+        const query = `
+            SELECT id, sku, descricao, quantidade
+            FROM public.skus
+            WHERE user_id = $1 AND is_kit = false
+            ORDER BY sku ASC
+        `;
+        const { rows } = await db.query(query, [userId]);
+        res.json(rows);
+    } catch (error) {
+        console.error('Erro ao buscar SKUs disponíveis para kit:', error);
+        res.status(500).json({ error: 'Erro interno ao buscar SKUs.' });
+    }
+});
+
+router.get('/user/:userId/skus', authenticateToken, async (req, res) => {
+    const { userId } = req.params;
+    
+    // Allow masters and the user themselves to access their own data
+    if (req.user.role !== 'master' && req.user.uid !== userId) {
+        return res.status(403).json({ error: 'Acesso negado.' });
+    }
     try {
         const query = `
             SELECT 
-                s.id, s.user_id, s.sku, s.descricao, s.dimensoes, s.quantidade, s.package_type_id,
-                pt.name as package_type_name, pt.price as package_type_price
+                s.id, s.user_id, s.sku, s.descricao, s.dimensoes, s.quantidade, s.package_type_id, s.kit_parent_id, s.is_kit,
+                pt.name as package_type_name, pt.price as package_type_price,
+                kp.nome as kit_parent_name
             FROM public.skus s
             LEFT JOIN public.package_types pt ON s.package_type_id = pt.id
+            LEFT JOIN public.kit_parents kp ON s.kit_parent_id = kp.id
             WHERE s.user_id = $1 
-            ORDER BY s.created_at DESC
+            ORDER BY s.is_kit ASC, s.created_at DESC
         `;
         const { rows } = await db.query(query, [userId]);
-        const skus = rows.map(sku => ({
-            ...sku,
-            dimensoes: typeof sku.dimensoes === 'string' ? JSON.parse(sku.dimensoes) : sku.dimensoes,
-            package_type_price: sku.package_type_price ? parseFloat(sku.package_type_price) : null
-        }));
+        
+        // Get kit components for all kit SKUs
+        const kitComponentsQuery = `
+            SELECT 
+                kc.kit_sku_id,
+                kc.child_sku_id,
+                kc.quantity_per_kit,
+                cs.sku as child_sku_code,
+                cs.descricao as child_descricao,
+                cs.quantidade as child_stock
+            FROM public.sku_kit_components kc
+            JOIN public.skus cs ON kc.child_sku_id = cs.id
+            WHERE kc.kit_sku_id IN (SELECT id FROM public.skus WHERE user_id = $1 AND is_kit = true)
+        `;
+        const kitComponentsResult = await db.query(kitComponentsQuery, [userId]);
+        
+        // Group kit components by kit_sku_id
+        const kitComponentsMap = {};
+        kitComponentsResult.rows.forEach(row => {
+            if (!kitComponentsMap[row.kit_sku_id]) {
+                kitComponentsMap[row.kit_sku_id] = [];
+            }
+            kitComponentsMap[row.kit_sku_id].push({
+                child_sku_id: row.child_sku_id,
+                child_sku_code: row.child_sku_code,
+                child_descricao: row.child_descricao,
+                child_stock: row.child_stock,
+                quantity_per_kit: row.quantity_per_kit
+            });
+        });
+        
+        const skus = rows.map(sku => {
+            const result = {
+                ...sku,
+                dimensoes: typeof sku.dimensoes === 'string' ? JSON.parse(sku.dimensoes) : sku.dimensoes,
+                package_type_price: sku.package_type_price ? parseFloat(sku.package_type_price) : null
+            };
+            
+            // Add kit components if this is a kit
+            if (sku.is_kit && kitComponentsMap[sku.id]) {
+                result.kit_components = kitComponentsMap[sku.id];
+                // Calculate available kit quantity based on child stock
+                result.available_kit_quantity = result.kit_components.reduce((min, component) => {
+                    const availableFromChild = Math.floor(component.child_stock / component.quantity_per_kit);
+                    return Math.min(min, availableFromChild);
+                }, Infinity);
+                if (result.available_kit_quantity === Infinity) result.available_kit_quantity = 0;
+            }
+            
+            return result;
+        });
+        
         res.json(skus);
     } catch (error) {
         console.error('Erro ao buscar SKUs do usuário:', error);
@@ -224,27 +301,75 @@ router.get('/user/:userId/skus', authenticateToken, requireMaster, async (req, r
     }
 });
 
-router.post('/user/:userId/skus', authenticateToken, requireMaster, async (req, res) => {
+router.post('/user/:userId/skus', authenticateToken, async (req, res) => {
     const { userId } = req.params;
-    const { sku, descricao, dimensoes, quantidade, package_type_id } = req.body;
+    const { sku, descricao, dimensoes, quantidade, package_type_id, kit_parent_id, is_kit, kit_components } = req.body;
+    
+    // Allow masters and the user themselves to manage their own data
+    if (req.user.role !== 'master' && req.user.uid !== userId) {
+        return res.status(403).json({ error: 'Acesso negado.' });
+    }
 
-    if (!sku || !descricao || !dimensoes || quantidade == null) {
-        return res.status(400).json({ error: 'Campos de SKU, descrição, dimensões e quantidade são obrigatórios.' });
+    if (!sku || !descricao || !dimensoes) {
+        return res.status(400).json({ error: 'Campos de SKU, descrição e dimensões são obrigatórios.' });
+    }
+
+    // For kits, quantidade should be 0 and kit_components should be provided
+    if (is_kit) {
+        if (!kit_components || !Array.isArray(kit_components) || kit_components.length === 0) {
+            return res.status(400).json({ error: 'Kit deve ter pelo menos um componente filho.' });
+        }
+        
+        // Validate kit components
+        for (const component of kit_components) {
+            if (!component.child_sku_id || !component.quantity_per_kit || component.quantity_per_kit <= 0) {
+                return res.status(400).json({ error: 'Todos os componentes do kit devem ter SKU filho e quantidade válidos.' });
+            }
+        }
+    } else {
+        if (quantidade == null || quantidade < 0) {
+            return res.status(400).json({ error: 'Quantidade é obrigatória para SKUs normais.' });
+        }
     }
 
     const client = await db.pool.connect();
     try {
         await client.query('BEGIN');
 
+        // Insert the main SKU
         const insertSkuQuery = `
-            INSERT INTO public.skus (user_id, sku, descricao, dimensoes, quantidade, package_type_id)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO public.skus (user_id, sku, descricao, dimensoes, quantidade, package_type_id, kit_parent_id, is_kit)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING id;
         `;
-        const skuResult = await client.query(insertSkuQuery, [userId, sku, descricao, JSON.stringify(dimensoes), quantidade, package_type_id || null]);
+        const finalQuantidade = is_kit ? 0 : quantidade;
+        const skuResult = await client.query(insertSkuQuery, [userId, sku, descricao, JSON.stringify(dimensoes), finalQuantidade, package_type_id || null, kit_parent_id || null, is_kit || false]);
         const newSkuId = skuResult.rows[0].id;
 
-        if (quantidade > 0) {
+        // If it's a kit, insert the kit components
+        if (is_kit && kit_components && kit_components.length > 0) {
+            for (const component of kit_components) {
+                // Verify that the child SKU exists and belongs to the same user
+                const childSkuCheck = await client.query(
+                    'SELECT id FROM public.skus WHERE id = $1 AND user_id = $2 AND is_kit = false',
+                    [component.child_sku_id, userId]
+                );
+                
+                if (childSkuCheck.rows.length === 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: `SKU filho com ID ${component.child_sku_id} não encontrado ou é um kit.` });
+                }
+                
+                const insertComponentQuery = `
+                    INSERT INTO public.sku_kit_components (kit_sku_id, child_sku_id, quantity_per_kit)
+                    VALUES ($1, $2, $3)
+                `;
+                await client.query(insertComponentQuery, [newSkuId, component.child_sku_id, component.quantity_per_kit]);
+            }
+        }
+
+        // Add initial stock movement for non-kit SKUs
+        if (!is_kit && quantidade > 0) {
             const insertMovementQuery = `
                 INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason)
                 VALUES ($1, $2, 'entrada', $3, 'Entrada inicial de estoque');
@@ -253,7 +378,7 @@ router.post('/user/:userId/skus', authenticateToken, requireMaster, async (req, 
         }
 
         await client.query('COMMIT');
-        res.status(201).json({ message: 'SKU adicionado com sucesso', skuId: newSkuId });
+        res.status(201).json({ message: is_kit ? 'Kit criado com sucesso' : 'SKU adicionado com sucesso', skuId: newSkuId });
 
     } catch (error) {
         await client.query('ROLLBACK');
@@ -267,9 +392,20 @@ router.post('/user/:userId/skus', authenticateToken, requireMaster, async (req, 
     }
 });
 
-router.put('/skus/:skuId', authenticateToken, requireMaster, async (req, res) => {
+router.put('/skus/:skuId', authenticateToken, async (req, res) => {
     const { skuId } = req.params;
-    const { descricao, dimensoes, package_type_id } = req.body;
+    const { descricao, dimensoes, package_type_id, kit_parent_id } = req.body;
+    
+    // Verify that the SKU belongs to the user or they are master
+    const skuOwnerCheck = await db.query('SELECT user_id FROM public.skus WHERE id = $1', [skuId]);
+    if (skuOwnerCheck.rows.length === 0) {
+        return res.status(404).json({ error: 'SKU não encontrado.' });
+    }
+    
+    const skuOwnerId = skuOwnerCheck.rows[0].user_id;
+    if (req.user.role !== 'master' && req.user.uid !== skuOwnerId) {
+        return res.status(403).json({ error: 'Acesso negado.' });
+    }
 
     if (!descricao || !dimensoes) {
         return res.status(400).json({ error: 'Descrição e dimensões são obrigatórios.' });
@@ -278,11 +414,11 @@ router.put('/skus/:skuId', authenticateToken, requireMaster, async (req, res) =>
     try {
         const query = `
             UPDATE public.skus
-            SET descricao = $1, dimensoes = $2, package_type_id = $3, updated_at = NOW()
-            WHERE id = $4
+            SET descricao = $1, dimensoes = $2, package_type_id = $3, kit_parent_id = $4, updated_at = NOW()
+            WHERE id = $5
             RETURNING *;
         `;
-        const { rows } = await db.query(query, [descricao, JSON.stringify(dimensoes), package_type_id || null, skuId]);
+        const { rows } = await db.query(query, [descricao, JSON.stringify(dimensoes), package_type_id || null, kit_parent_id || null, skuId]);
         if (rows.length === 0) {
             return res.status(404).json({ error: 'SKU não encontrado.' });
         }
@@ -396,31 +532,98 @@ router.post('/sku/:skuCode/movements', authenticateToken, requireMaster, async (
     try {
         await client.query('BEGIN');
 
-        const findSkuQuery = 'SELECT id, quantidade FROM public.skus WHERE sku = $1 AND user_id = $2 FOR UPDATE';
+        const findSkuQuery = 'SELECT id, quantidade, is_kit FROM public.skus WHERE sku = $1 AND user_id = $2 FOR UPDATE';
         const skuFound = await client.query(findSkuQuery, [skuCode, userId]);
 
         if (skuFound.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'SKU não encontrado ou pertence a outro usuário.' });
         }
-        const { id: skuId, quantidade: currentQuantity } = skuFound.rows[0];
+        const { id: skuId, quantidade: currentQuantity, is_kit } = skuFound.rows[0];
 
-        const finalQuantityChange = movementType === 'entrada' ? quantityChange : -quantityChange;
+        // If this is a kit and it's a sale (saida), we need to deduct from child SKUs
+        if (is_kit && movementType === 'saida') {
+            // Get kit components
+            const kitComponentsQuery = `
+                SELECT child_sku_id, quantity_per_kit
+                FROM public.sku_kit_components
+                WHERE kit_sku_id = $1
+            `;
+            const kitComponents = await client.query(kitComponentsQuery, [skuId]);
 
-        if (movementType === 'saida' && currentQuantity < quantityChange) {
-             console.warn(`Alerta: Estoque do SKU ${skuCode} ficará negativo. Estoque atual: ${currentQuantity}, Saída: ${quantityChange}`);
+            if (kitComponents.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'Kit não possui componentes filhos configurados.' });
+            }
+
+            // Check if we have enough stock of all child SKUs
+            for (const component of kitComponents.rows) {
+                const childSkuQuery = 'SELECT id, sku, quantidade FROM public.skus WHERE id = $1 FOR UPDATE';
+                const childSku = await client.query(childSkuQuery, [component.child_sku_id]);
+                
+                if (childSku.rows.length === 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: 'SKU filho não encontrado.' });
+                }
+                
+                const requiredQuantity = component.quantity_per_kit * quantityChange;
+                if (childSku.rows[0].quantidade < requiredQuantity) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ 
+                        error: `Estoque insuficiente do SKU filho ${childSku.rows[0].sku}. Disponível: ${childSku.rows[0].quantidade}, Necessário: ${requiredQuantity}` 
+                    });
+                }
+            }
+
+            // Deduct from child SKUs
+            for (const component of kitComponents.rows) {
+                const requiredQuantity = component.quantity_per_kit * quantityChange;
+                
+                // Update child SKU quantity
+                const updateChildQuery = `
+                    UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2;
+                `;
+                await client.query(updateChildQuery, [requiredQuantity, component.child_sku_id]);
+                
+                // Record movement for child SKU
+                const insertChildMovementQuery = `
+                    INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+                    VALUES ($1, $2, 'saida', $3, $4, $5);
+                `;
+                await client.query(insertChildMovementQuery, [
+                    component.child_sku_id, 
+                    userId, 
+                    requiredQuantity, 
+                    `Saída por Kit: ${reason}`, 
+                    relatedSaleId || null
+                ]);
+            }
+
+            // Record movement for the kit itself (informational)
+            const insertKitMovementQuery = `
+                INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+                VALUES ($1, $2, $3, $4, $5, $6) RETURNING *;
+            `;
+            await client.query(insertKitMovementQuery, [skuId, userId, movementType, quantityChange, reason, relatedSaleId || null]);
+        } else {
+            // Regular SKU movement logic
+            const finalQuantityChange = movementType === 'entrada' ? quantityChange : -quantityChange;
+
+            if (movementType === 'saida' && currentQuantity < quantityChange) {
+                console.warn(`Alerta: Estoque do SKU ${skuCode} ficará negativo. Estoque atual: ${currentQuantity}, Saída: ${quantityChange}`);
+            }
+
+            const updateSkuQuery = `
+                UPDATE public.skus SET quantidade = quantidade + $1, updated_at = NOW() WHERE id = $2;
+            `;
+            await client.query(updateSkuQuery, [finalQuantityChange, skuId]);
+
+            const insertMovementQuery = `
+                INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+                VALUES ($1, $2, $3, $4, $5, $6) RETURNING *;
+            `;
+            await client.query(insertMovementQuery, [skuId, userId, movementType, quantityChange, reason, relatedSaleId || null]);
         }
-
-        const updateSkuQuery = `
-            UPDATE public.skus SET quantidade = quantidade + $1, updated_at = NOW() WHERE id = $2;
-        `;
-        await client.query(updateSkuQuery, [finalQuantityChange, skuId]);
-
-        const insertMovementQuery = `
-            INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-            VALUES ($1, $2, $3, $4, $5, $6) RETURNING *;
-        `;
-        await client.query(insertMovementQuery, [skuId, userId, movementType, quantityChange, reason, relatedSaleId || null]);
 
         await client.query('COMMIT');
         res.status(201).json({ message: 'Movimentação registrada com sucesso.' });

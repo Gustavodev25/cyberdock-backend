@@ -418,7 +418,7 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
       }
 
       const skuQ = `
-        SELECT id, quantidade
+        SELECT id, quantidade, is_kit
           FROM public.skus
          WHERE UPPER(TRIM(sku)) = UPPER(TRIM($1))
            AND user_id = $2
@@ -431,23 +431,97 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
       }
 
       const stock = skuR.rows[0];
-      if (Number(stock.quantidade) < quantitySold) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: `Estoque insuficiente para SKU '${sku}'.` });
+      
+      // Handle kit vs regular SKU logic
+      if (stock.is_kit) {
+        // For kits, check component availability and deduct from child SKUs
+        const kitComponentsQuery = `
+          SELECT child_sku_id, quantity_per_kit
+          FROM public.sku_kit_components
+          WHERE kit_sku_id = $1
+        `;
+        const kitComponents = await client.query(kitComponentsQuery, [stock.id]);
+
+        if (kitComponents.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: `Kit '${sku}' não possui componentes configurados.` });
+        }
+
+        // Check if we have enough stock of all child SKUs
+        for (const component of kitComponents.rows) {
+          const childSkuQuery = 'SELECT id, sku, quantidade FROM public.skus WHERE id = $1 FOR UPDATE';
+          const childSku = await client.query(childSkuQuery, [component.child_sku_id]);
+          
+          if (childSku.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: `SKU filho não encontrado para o kit '${sku}'.` });
+          }
+          
+          const requiredQuantity = component.quantity_per_kit * quantitySold;
+          if (childSku.rows[0].quantidade < requiredQuantity) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ 
+              error: `Estoque insuficiente do SKU filho ${childSku.rows[0].sku} para o kit '${sku}'. Disponível: ${childSku.rows[0].quantidade}, Necessário: ${requiredQuantity}` 
+            });
+          }
+        }
+
+        // Deduct from child SKUs
+        for (const component of kitComponents.rows) {
+          const requiredQuantity = component.quantity_per_kit * quantitySold;
+          
+          // Update child SKU quantity
+          const updateChildQuery = `
+            UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2;
+          `;
+          await client.query(updateChildQuery, [requiredQuantity, component.child_sku_id]);
+          
+          // Record movement for child SKU
+          const insertChildMovementQuery = `
+            INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+            VALUES ($1, $2, 'saida', $3, $4, $5)
+          `;
+          await client.query(insertChildMovementQuery, [
+            component.child_sku_id, 
+            uid, 
+            requiredQuantity, 
+            `Saída por Kit: Saída por Venda - ID: ${saleId}`, 
+            saleId
+          ]);
+        }
+
+        // Record movement for the kit itself (informational)
+        const insertKitMovementQuery = `
+          INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+          VALUES ($1, $2, 'saida', $3, $4, $5)
+        `;
+        await client.query(insertKitMovementQuery, [
+          stock.id, 
+          uid, 
+          quantitySold, 
+          `Saída por Venda - ID: ${saleId}`, 
+          saleId
+        ]);
+      } else {
+        // Regular SKU logic
+        if (Number(stock.quantidade) < quantitySold) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: `Estoque insuficiente para SKU '${sku}'.` });
+        }
+
+        await client.query(
+          'UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2',
+          [quantitySold, stock.id]
+        );
+
+        const reason = `Saída por Venda - ID: ${saleId}`;
+        await client.query(
+          `INSERT INTO public.stock_movements
+             (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+           VALUES ($1, $2, 'saida', $3, $4, $5)`,
+          [stock.id, uid, quantitySold, reason, saleId]
+        );
       }
-
-      await client.query(
-        'UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2',
-        [quantitySold, stock.id]
-      );
-
-      const reason = `Saída por Venda - ID: ${saleId}`;
-      await client.query(
-        `INSERT INTO public.stock_movements
-           (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-         VALUES ($1, $2, 'saida', $3, $4, $5)`,
-        [stock.id, uid, quantitySold, reason, saleId]
-      );
 
       const updSaleQ = `
         UPDATE public.sales
@@ -522,7 +596,7 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         await client.query('BEGIN');
 
         const skuQ = `
-          SELECT id, quantidade
+          SELECT id, quantidade, is_kit
             FROM public.skus
            WHERE UPPER(TRIM(sku)) = UPPER(TRIM($1))
              AND user_id = $2
@@ -532,22 +606,91 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         if (skuR.rowCount === 0) throw new Error(`SKU '${sale.sku}' não encontrado.`);
 
         const stock = skuR.rows[0];
-        if (Number(stock.quantidade) < Number(sale.quantity)) {
-          throw new Error(`Estoque insuficiente para SKU '${sale.sku}'.`);
+        
+        // Handle kit vs regular SKU logic
+        if (stock.is_kit) {
+          // For kits, check component availability and deduct from child SKUs
+          const kitComponentsQuery = `
+            SELECT child_sku_id, quantity_per_kit
+            FROM public.sku_kit_components
+            WHERE kit_sku_id = $1
+          `;
+          const kitComponents = await client.query(kitComponentsQuery, [stock.id]);
+
+          if (kitComponents.rows.length === 0) {
+            throw new Error(`Kit '${sale.sku}' não possui componentes configurados.`);
+          }
+
+          // Check if we have enough stock of all child SKUs
+          for (const component of kitComponents.rows) {
+            const childSkuQuery = 'SELECT id, sku, quantidade FROM public.skus WHERE id = $1 FOR UPDATE';
+            const childSku = await client.query(childSkuQuery, [component.child_sku_id]);
+            
+            if (childSku.rows.length === 0) {
+              throw new Error(`SKU filho não encontrado para o kit '${sale.sku}'.`);
+            }
+            
+            const requiredQuantity = component.quantity_per_kit * sale.quantity;
+            if (childSku.rows[0].quantidade < requiredQuantity) {
+              throw new Error(`Estoque insuficiente do SKU filho ${childSku.rows[0].sku} para o kit '${sale.sku}'. Disponível: ${childSku.rows[0].quantidade}, Necessário: ${requiredQuantity}`);
+            }
+          }
+
+          // Deduct from child SKUs
+          for (const component of kitComponents.rows) {
+            const requiredQuantity = component.quantity_per_kit * sale.quantity;
+            
+            // Update child SKU quantity
+            const updateChildQuery = `
+              UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2;
+            `;
+            await client.query(updateChildQuery, [requiredQuantity, component.child_sku_id]);
+            
+            // Record movement for child SKU
+            const insertChildMovementQuery = `
+              INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+              VALUES ($1, $2, 'saida', $3, $4, $5)
+            `;
+            await client.query(insertChildMovementQuery, [
+              component.child_sku_id, 
+              sale.uid, 
+              requiredQuantity, 
+              `Saída por Kit: Saída por Venda em Lote - ID: ${sale.id}`, 
+              sale.id
+            ]);
+          }
+
+          // Record movement for the kit itself (informational)
+          const insertKitMovementQuery = `
+            INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+            VALUES ($1, $2, 'saida', $3, $4, $5)
+          `;
+          await client.query(insertKitMovementQuery, [
+            stock.id, 
+            sale.uid, 
+            sale.quantity, 
+            `Saída por Venda em Lote - ID: ${sale.id}`, 
+            sale.id
+          ]);
+        } else {
+          // Regular SKU logic
+          if (Number(stock.quantidade) < Number(sale.quantity)) {
+            throw new Error(`Estoque insuficiente para SKU '${sale.sku}'.`);
+          }
+
+          await client.query('UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2', [
+            sale.quantity,
+            stock.id
+          ]);
+
+          const reason = `Saída por Venda em Lote - ID: ${sale.id}`;
+          await client.query(
+            `INSERT INTO public.stock_movements
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+             VALUES ($1, $2, 'saida', $3, $4, $5)`,
+            [stock.id, sale.uid, sale.quantity, reason, sale.id]
+          );
         }
-
-        await client.query('UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2', [
-          sale.quantity,
-          stock.id
-        ]);
-
-        const reason = `Saída por Venda em Lote - ID: ${sale.id}`;
-        await client.query(
-          `INSERT INTO public.stock_movements
-             (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-           VALUES ($1, $2, 'saida', $3, $4, $5)`,
-          [stock.id, sale.uid, sale.quantity, reason, sale.id]
-        );
 
         const updSaleQ = `
           UPDATE public.sales

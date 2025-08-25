@@ -75,6 +75,8 @@ const schema = {
             dimensoes JSONB,
             quantidade INTEGER DEFAULT 0,
             package_type_id INTEGER REFERENCES public.package_types(id) ON DELETE SET NULL,
+            kit_parent_id INTEGER,
+            is_kit BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP WITH TIME ZONE,
             UNIQUE (user_id, sku)
@@ -129,6 +131,25 @@ const schema = {
             total_price NUMERIC(10, 2) NOT NULL,
             type VARCHAR(50) NOT NULL,
             service_date DATE
+        );`,
+    sku_kit_components: `
+        CREATE TABLE public.sku_kit_components (
+            id SERIAL PRIMARY KEY,
+            kit_sku_id INTEGER NOT NULL REFERENCES public.skus(id) ON DELETE CASCADE,
+            child_sku_id INTEGER NOT NULL REFERENCES public.skus(id) ON DELETE CASCADE,
+            quantity_per_kit INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (kit_sku_id, child_sku_id)
+        );`,
+    kit_parents: `
+        CREATE TABLE public.kit_parents (
+            id SERIAL PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL REFERENCES public.users(uid) ON DELETE CASCADE,
+            nome VARCHAR(255) NOT NULL,
+            descricao TEXT,
+            ativo BOOLEAN DEFAULT true,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );`
 };
 
@@ -141,7 +162,7 @@ async function syncDatabaseSchema() {
         
         const tablesInOrder = [
             'users', 'package_types', 'services', 'ml_accounts', 'system_settings',
-            'user_statuses', 'user_contracts', 'skus', 'sales', 'stock_movements',
+            'user_statuses', 'user_contracts', 'skus', 'sku_kit_components', 'kit_parents', 'sales', 'stock_movements',
             'invoices', 'invoice_items'
         ];
 
@@ -183,6 +204,31 @@ async function syncDatabaseSchema() {
                     if (colRes.rowCount === 0) {
                         console.log(`   -> Adicionando coluna 'service_date' à tabela: public.invoice_items`);
                         await client.query('ALTER TABLE public.invoice_items ADD COLUMN service_date DATE;');
+                    }
+                }
+                if (tableName === 'skus') {
+                    const isKitColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'skus' AND column_name = 'is_kit'`);
+                    if (isKitColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'is_kit' à tabela: public.skus`);
+                        await client.query('ALTER TABLE public.skus ADD COLUMN is_kit BOOLEAN DEFAULT FALSE;');
+                    }
+                    const kitParentColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'skus' AND column_name = 'kit_parent_id'`);
+                    if (kitParentColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'kit_parent_id' à tabela: public.skus`);
+                        await client.query('ALTER TABLE public.skus ADD COLUMN kit_parent_id INTEGER;');
+                    }
+                }
+                if (tableName === 'kit_parents') {
+                    // Criar índice para otimizar buscas por user_id na tabela kit_parents
+                    const indexCheck = await client.query(`
+                        SELECT 1 FROM pg_indexes 
+                        WHERE schemaname = 'public' 
+                        AND tablename = 'kit_parents' 
+                        AND indexname = 'idx_kit_parents_user_id'
+                    `);
+                    if (indexCheck.rowCount === 0) {
+                        console.log(`   -> Criando índice 'idx_kit_parents_user_id' na tabela: public.kit_parents`);
+                        await client.query('CREATE INDEX idx_kit_parents_user_id ON public.kit_parents(user_id);');
                     }
                 }
             }

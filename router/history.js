@@ -1,4 +1,3 @@
-// backend/routes/history.js
 const express = require('express');
 const db = require('../utils/postgres');
 const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
@@ -6,63 +5,228 @@ const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
 const router = express.Router();
 
 /**
- * @route   GET /api/history/services
- * @desc    Busca o histórico de todos os serviços contratados por todos os clientes.
+ * @route   GET /api/history/contracts
+ * @desc    Busca o histórico de serviços recorrentes (contratos).
  * @access  Private (Master)
- * @query   ?clientId=<uid> - Filtra por um cliente específico
- * @query   ?serviceId=<id> - Filtra por um serviço específico
  */
-router.get('/services', authenticateToken, requireMaster, async (req, res) => {
-    const { clientId, serviceId } = req.query;
+router.get('/contracts', authenticateToken, requireMaster, async (req, res) => {
+  const { clientId, serviceId } = req.query;
 
-    try {
-        // CORREÇÃO:
-        // 1. Tabela padronizada para 'user_contracts' com alias 'uc'.
-        // 2. Removida a coluna 'created_at' que não existe.
-        // 3. Ordenação feita pela coluna 'start_date'.
-        let query = `
-            SELECT
-                uc.id AS contract_id,
-                uc.uid AS user_id,
-                u.email AS user_email,
-                (SELECT nickname FROM public.ml_accounts WHERE uid = u.uid ORDER BY created_at ASC LIMIT 1) as user_nickname,
-                uc.service_id,
-                s.name AS service_name,
-                uc.start_date,
-                uc.volume
-            FROM
-                public.user_contracts uc
-            JOIN
-                public.users u ON uc.uid = u.uid
-            JOIN
-                public.services s ON uc.service_id = s.id
-        `;
+  let query = `
+    SELECT
+      uc.id AS contract_id,
+      uc.uid AS user_id,
+      u.email AS user_email,
+      COALESCE(ml.nickname, u.email) AS user_nickname,
+      s.id AS service_id,
+      s.name AS service_name,
+      uc.volume,
+      uc.start_date,
+      uc.start_date AS contracted_at
+    FROM public.user_contracts uc
+    JOIN public.users u ON uc.uid = u.uid
+    JOIN public.services s ON uc.service_id = s.id
+    LEFT JOIN (
+      SELECT uid, nickname
+      FROM (
+        SELECT uid, nickname,
+               ROW_NUMBER() OVER (PARTITION BY uid ORDER BY connected_at ASC NULLS LAST) AS rn
+        FROM public.ml_accounts
+      ) ranked_accounts
+      WHERE rn = 1
+    ) ml ON u.uid = ml.uid
+    WHERE 1=1
+  `;
 
-        const params = [];
-        const conditions = [];
+  const params = [];
+  if (clientId) {
+    params.push(clientId);
+    query += ` AND uc.uid = $${params.length}`;
+  }
+  if (serviceId) {
+    params.push(serviceId);
+    query += ` AND uc.service_id = $${params.length}`;
+  }
 
-        if (clientId) {
-            params.push(clientId);
-            conditions.push(`uc.uid = $${params.length}`);
-        }
-        if (serviceId) {
-            params.push(serviceId);
-            conditions.push(`uc.service_id = $${params.length}`);
-        }
+  query += ' ORDER BY uc.start_date DESC, uc.id DESC';
 
-        if (conditions.length > 0) {
-            query += ' WHERE ' + conditions.join(' AND ');
-        }
+  try {
+    const { rows } = await db.query(query, params);
+    res.json(rows);
+  } catch (error) {
+    console.error('Erro ao buscar histórico de contratos:', error);
+    res.status(500).json({ error: 'Erro interno do servidor.' });
+  }
+});
 
-        query += ' ORDER BY uc.start_date DESC;';
+/**
+ * @route   GET /api/history/manual
+ * @desc    Busca o histórico de serviços avulsos (lançados manualmente).
+ * @access  Private (Master)
+ */
+router.get('/manual', authenticateToken, requireMaster, async (req, res) => {
+  const { clientId } = req.query;
 
-        const { rows } = await db.query(query, params);
-        res.json(rows);
+  let query = `
+    SELECT
+      ii.id,
+      ii.invoice_id,
+      i.uid AS user_id,
+      u.email AS user_email,
+      COALESCE(ml.nickname, u.email) AS user_nickname,
+      ii.description,
+      ii.quantity,
+      ii.unit_price,
+      ii.service_date AS entry_date,
+      ii.total_price,
+      i.period
+    FROM public.invoice_items ii
+    JOIN public.invoices i ON ii.invoice_id = i.id
+    JOIN public.users u ON i.uid = u.uid
+    LEFT JOIN (
+      SELECT uid, nickname
+      FROM (
+        SELECT uid, nickname,
+               ROW_NUMBER() OVER (PARTITION BY uid ORDER BY connected_at ASC NULLS LAST) AS rn
+        FROM public.ml_accounts
+      ) ranked_accounts
+      WHERE rn = 1
+    ) ml ON u.uid = ml.uid
+    WHERE ii.type = 'manual'
+  `;
 
-    } catch (error) {
-        console.error("Erro ao buscar histórico de serviços:", error);
-        res.status(500).json({ error: 'Erro interno ao buscar histórico de serviços.' });
+  const params = [];
+  if (clientId) {
+    params.push(clientId);
+    query += ` AND i.uid = $${params.length}`;
+  }
+
+  query += ' ORDER BY ii.service_date DESC NULLS LAST, ii.id DESC';
+
+  try {
+    const { rows } = await db.query(query, params);
+    const formattedRows = rows.map(row => ({
+      ...row,
+      quantity: row.quantity != null ? parseFloat(row.quantity) : null,
+      unit_price: row.unit_price != null ? parseFloat(row.unit_price) : null,
+      total_price: row.total_price != null ? parseFloat(row.total_price) : null,
+    }));
+    res.json(formattedRows);
+  } catch (error) {
+    console.error('Erro ao buscar histórico de serviços avulsos:', error);
+    res.status(500).json({ error: 'Erro interno do servidor.' });
+  }
+});
+
+/**
+ * @route   PUT /api/history/manual/:id
+ * @desc    Atualiza um serviço avulso.
+ * @access  Private (Master)
+ */
+router.put('/manual/:id', authenticateToken, requireMaster, async (req, res) => {
+  const { id } = req.params;
+  const { description, quantity, unit_price, entry_date } = req.body;
+
+  if (!description || quantity == null || unit_price == null || !entry_date) {
+    return res.status(400).json({
+      error: 'Todos os campos são obrigatórios: description, quantity, unit_price, entry_date.',
+    });
+  }
+
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    // Update invoice item
+    const updateQuery = `
+      UPDATE public.invoice_items
+      SET
+        description = $1,
+        quantity = $2,
+        unit_price = $3,
+        service_date = $4,
+        total_price = $2 * $3
+      WHERE id = $5 AND type = 'manual'
+      RETURNING *;
+    `;
+    const { rows } = await client.query(updateQuery, [description, quantity, unit_price, entry_date, id]);
+
+    if (rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Serviço avulso não encontrado ou não é do tipo manual.' });
     }
+
+    // Recalculate invoice total
+    const invoiceId = rows[0].invoice_id;
+    const sumRes = await client.query(`
+      SELECT COALESCE(SUM(total_price), 0) AS sum
+      FROM public.invoice_items WHERE invoice_id = $1;
+    `, [invoiceId]);
+    const newTotal = parseFloat(sumRes.rows[0].sum || 0);
+    await client.query(`UPDATE public.invoices SET total_amount = $1 WHERE id = $2`, [newTotal, invoiceId]);
+
+    await client.query('COMMIT');
+    res.json(rows[0]);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Erro ao atualizar serviço avulso:', error);
+    res.status(500).json({ error: 'Erro interno do servidor.' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * @route   DELETE /api/history/manual/:id
+ * @desc    Deleta um serviço avulso.
+ * @access  Private (Master)
+ */
+router.delete('/manual/:id', authenticateToken, requireMaster, async (req, res) => {
+  const { id } = req.params;
+
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    // Get invoice_id before deleting
+    const getInvoiceQuery = 'SELECT invoice_id FROM public.invoice_items WHERE id = $1 AND type = \'manual\'';
+    const invoiceResult = await client.query(getInvoiceQuery, [id]);
+    
+    if (invoiceResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Serviço avulso não encontrado ou não é do tipo manual.' });
+    }
+    
+    const invoiceId = invoiceResult.rows[0].invoice_id;
+    
+    // Delete the item
+    const { rowCount } = await client.query(
+      "DELETE FROM public.invoice_items WHERE id = $1 AND type = 'manual'",
+      [id]
+    );
+
+    if (rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Serviço avulso não encontrado ou não é do tipo manual.' });
+    }
+    
+    // Recalculate invoice total
+    const sumRes = await client.query(`
+      SELECT COALESCE(SUM(total_price), 0) AS sum
+      FROM public.invoice_items WHERE invoice_id = $1;
+    `, [invoiceId]);
+    const newTotal = parseFloat(sumRes.rows[0].sum || 0);
+    await client.query(`UPDATE public.invoices SET total_amount = $1 WHERE id = $2`, [newTotal, invoiceId]);
+
+    await client.query('COMMIT');
+    res.status(200).json({ message: 'Serviço avulso excluído com sucesso.' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Erro ao excluir serviço avulso:', error);
+    res.status(500).json({ error: 'Erro interno do servidor.' });
+  } finally {
+    client.release();
+  }
 });
 
 module.exports = router;
