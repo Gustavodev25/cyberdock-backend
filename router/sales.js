@@ -207,26 +207,48 @@ function buildMultiUpdateQuery_Backfill(rows) {
 }
 
 // Passo de backfill: escaneia vendas salvas com dados faltantes e preenche
-async function runBackfillMissing({ db, clientId, nickname, targetUid, userId, access_token }) {
+async function runBackfillMissing({ db, clientId, nickname, targetUid, userId, access_token, isMaster = false }) {
   sendEvent(clientId, { progress: 40, message: `[${nickname}] Procurando vendas com dados faltantes...`, type: 'info' });
 
-  const candidatesQ = `
-    SELECT id, sku, uid, seller_id, account_nickname, sale_date
-      FROM public.sales
-     WHERE uid = $1
-       AND seller_id = $2
-       AND (
-         raw_api_data IS NULL
-         OR raw_api_data->'shipping' IS NULL
-         OR raw_api_data->'sla_data' IS NULL
-         OR shipping_mode IS NULL
-         OR shipping_mode = 'Outros'
-         OR shipping_limit_date IS NULL
-       )
-     ORDER BY sale_date DESC
-     LIMIT $3;
-  `;
-  const cand = await db.query(candidatesQ, [targetUid, userId, MAX_ORDERS]);
+  let candidatesQ, cand;
+  if (isMaster) {
+    // Para masters, busca vendas da conta específica sem restrição de seller_id
+    candidatesQ = `
+      SELECT id, sku, uid, seller_id, account_nickname, sale_date
+        FROM public.sales
+       WHERE uid = $1
+         AND (
+           raw_api_data IS NULL
+           OR raw_api_data->'shipping' IS NULL
+           OR raw_api_data->'sla_data' IS NULL
+           OR shipping_mode IS NULL
+           OR shipping_mode = 'Outros'
+           OR shipping_limit_date IS NULL
+         )
+       ORDER BY sale_date DESC
+       LIMIT $2;
+    `;
+    cand = await db.query(candidatesQ, [targetUid, MAX_ORDERS]);
+  } else {
+    // Para usuários normais, mantém a restrição de seller_id
+    candidatesQ = `
+      SELECT id, sku, uid, seller_id, account_nickname, sale_date
+        FROM public.sales
+       WHERE uid = $1
+         AND seller_id = $2
+         AND (
+           raw_api_data IS NULL
+           OR raw_api_data->'shipping' IS NULL
+           OR raw_api_data->'sla_data' IS NULL
+           OR shipping_mode IS NULL
+           OR shipping_mode = 'Outros'
+           OR shipping_limit_date IS NULL
+         )
+       ORDER BY sale_date DESC
+       LIMIT $3;
+    `;
+    cand = await db.query(candidatesQ, [targetUid, userId, MAX_ORDERS]);
+  }
 
   if (cand.rowCount === 0) {
     sendEvent(clientId, { progress: 55, message: `[${nickname}] Nada para completar. Nenhum dado faltante.`, type: 'success' });
@@ -418,10 +440,10 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
       }
 
       const skuQ = `
-        SELECT id, quantidade, is_kit
-          FROM public.skus
-         WHERE UPPER(TRIM(sku)) = UPPER(TRIM($1))
-           AND user_id = $2
+        SELECT s.id, s.quantidade, s.is_kit, s.package_type_id, s.sku as sku_code
+          FROM public.skus s
+         WHERE UPPER(TRIM(s.sku)) = UPPER(TRIM($1))
+           AND s.user_id = $2
          FOR UPDATE;
       `;
       const skuR = await client.query(skuQ, [sku, uid]);
@@ -431,6 +453,29 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
       }
 
       const stock = skuR.rows[0];
+      
+      // Check if this SKU is a component of any kit (for package_type logic)
+      let isKitComponent = false;
+      let kitPackageTypeId = null;
+      let kitSkuCode = null;
+      
+      if (!stock.is_kit) {
+        // Check if this SKU is used as a component in any kit
+        const kitComponentCheckQuery = `
+          SELECT kc.kit_sku_id, ks.sku as kit_sku_code, ks.package_type_id
+          FROM public.sku_kit_components kc
+          JOIN public.skus ks ON kc.kit_sku_id = ks.id
+          WHERE kc.child_sku_id = $1 AND ks.user_id = $2
+        `;
+        const kitComponentCheck = await client.query(kitComponentCheckQuery, [stock.id, uid]);
+        
+        if (kitComponentCheck.rows.length > 0) {
+          isKitComponent = true;
+          // Use the first kit's package_type (assuming one component can't be in multiple kits)
+          kitPackageTypeId = kitComponentCheck.rows[0].package_type_id;
+          kitSkuCode = kitComponentCheck.rows[0].kit_sku_code;
+        }
+      }
       
       // Handle kit vs regular SKU logic
       if (stock.is_kit) {
@@ -515,11 +560,22 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
         );
 
         const reason = `Saída por Venda - ID: ${saleId}`;
+        
+        // Determine which package_type to use based on context
+        let effectivePackageTypeId = stock.package_type_id;
+        let packageTypeContext = 'SKU próprio';
+        
+        if (isKitComponent && kitPackageTypeId) {
+          // If this SKU is a kit component, use the kit's package_type for billing
+          effectivePackageTypeId = kitPackageTypeId;
+          packageTypeContext = `Kit: ${kitSkuCode}`;
+        }
+        
         await client.query(
           `INSERT INTO public.stock_movements
-             (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-           VALUES ($1, $2, 'saida', $3, $4, $5)`,
-          [stock.id, uid, quantitySold, reason, saleId]
+             (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, package_type_id, package_type_context)
+           VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7)`,
+          [stock.id, uid, quantitySold, reason, saleId, effectivePackageTypeId, packageTypeContext]
         );
       }
 
@@ -732,13 +788,30 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
 
   try {
     sendEvent(clientId, { progress: 10, message: `[${nickname}] Buscando credenciais...`, type: 'info' });
-    const accQ = 'SELECT access_token, refresh_token FROM public.ml_accounts WHERE user_id = $1 AND uid = $2';
-    const accRes = await db.query(accQ, [userId, targetUid]);
+    
+    // Se for master, busca a conta diretamente pelo uid, sem restrição de user_id
+    let accQ, accRes;
+    if (req.user.role === 'master') {
+      accQ = 'SELECT access_token, refresh_token FROM public.ml_accounts WHERE uid = $1';
+      accRes = await db.query(accQ, [targetUid]);
+    } else {
+      accQ = 'SELECT access_token, refresh_token FROM public.ml_accounts WHERE user_id = $1 AND uid = $2';
+      accRes = await db.query(accQ, [userId, targetUid]);
+    }
+    
     if (accRes.rowCount === 0) throw new Error('Conta ML não encontrada ou não pertence ao usuário.');
     let { access_token, refresh_token } = accRes.rows[0];
 
     if (backfill) {
-      await runBackfillMissing({ db, clientId, nickname, targetUid, userId, access_token });
+      await runBackfillMissing({ 
+        db, 
+        clientId, 
+        nickname, 
+        targetUid, 
+        userId, 
+        access_token, 
+        isMaster: req.user.role === 'master' 
+      });
     }
 
     let lastSyncDate;
@@ -749,10 +822,21 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       lastSyncDate = maxLookbackDate;
       sendEvent(clientId, { progress: 15, message: `[${nickname}] Sincronização forçada iniciada...`, type: 'info' });
     } else {
-      const lastSyncRes = await db.query(
-        `SELECT MAX(sale_date) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
-        [targetUid, userId]
-      );
+      let lastSyncRes;
+      if (req.user.role === 'master') {
+        // Para masters, busca a última venda da conta específica, independente do seller_id
+        lastSyncRes = await db.query(
+          `SELECT MAX(sale_date) AS last_sale FROM public.sales WHERE uid = $1`,
+          [targetUid]
+        );
+      } else {
+        // Para usuários normais, mantém a restrição de seller_id
+        lastSyncRes = await db.query(
+          `SELECT MAX(sale_date) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
+          [targetUid, userId]
+        );
+      }
+      
       lastSyncDate = lastSyncRes.rows[0]?.last_sale ? new Date(lastSyncRes.rows[0].last_sale) : null;
 
       if (!lastSyncDate || lastSyncDate < maxLookbackDate) {
@@ -771,7 +855,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       const limit = Math.min(PAGE_LIMIT, MAX_ORDERS - orderSummaries.length);
       const ordersUrl =
         `https://api.mercadolibre.com/orders/search` +
-        `?seller=${userId}&offset=${offset}&limit=${limit}&sort=date_desc` +
+        `?seller=${targetUid}&offset=${offset}&limit=${limit}&sort=date_desc` +
         `&order.date_created.from=${encodeURIComponent(lastSyncDate.toISOString())}`;
 
       let ordersResponse = await fetch(ordersUrl, { headers: { Authorization: `Bearer ${access_token}` } });
@@ -791,16 +875,27 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
           })
         });
         if (!refreshResponse.ok) {
-          await db.query("UPDATE public.ml_accounts SET status = 'reconnect_needed' WHERE user_id = $1 AND uid = $2", [userId, targetUid]);
+          if (req.user.role === 'master') {
+            await db.query("UPDATE public.ml_accounts SET status = 'reconnect_needed' WHERE uid = $1", [targetUid]);
+          } else {
+            await db.query("UPDATE public.ml_accounts SET status = 'reconnect_needed' WHERE user_id = $1 AND uid = $2", [userId, targetUid]);
+          }
           throw new Error('Falha ao renovar token. É necessário reconectar a conta.');
         }
         const newTokenData = await refreshResponse.json();
         access_token = newTokenData.access_token;
         refresh_token = newTokenData.refresh_token;
-        await db.query(
-          'UPDATE public.ml_accounts SET access_token = $1, refresh_token = $2, expires_in = $3, status = \'active\', updated_at = NOW() WHERE user_id = $4 AND uid = $5',
-          [access_token, refresh_token, newTokenData.expires_in, userId, targetUid]
-        );
+        if (req.user.role === 'master') {
+          await db.query(
+            'UPDATE public.ml_accounts SET access_token = $1, refresh_token = $2, expires_in = $3, status = \'active\', updated_at = NOW() WHERE uid = $4',
+            [access_token, refresh_token, newTokenData.expires_in, targetUid]
+          );
+        } else {
+          await db.query(
+            'UPDATE public.ml_accounts SET access_token = $1, refresh_token = $2, expires_in = $3, status = \'active\', updated_at = NOW() WHERE user_id = $4 AND uid = $5',
+            [access_token, refresh_token, newTokenData.expires_in, userId, targetUid]
+          );
+        }
         sendEvent(clientId, { progress: 30, message: `[${nickname}] Token atualizado. Retomando busca...`, type: 'info' });
         ordersResponse = await fetch(ordersUrl, { headers: { Authorization: `Bearer ${access_token}` } });
       }

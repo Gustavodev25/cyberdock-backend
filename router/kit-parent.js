@@ -99,29 +99,40 @@ router.post('/user/:userId', authenticateToken, async (req, res) => {
     const { userId } = req.params;
     const { nome, descricao, ativo = true } = req.body;
     
+    console.log('🚀 [BACKEND] POST /kit-parent/user/:userId iniciado');
+    console.log('🔑 [BACKEND] userId da URL:', userId);
+    console.log('🔑 [BACKEND] req.user:', req.user);
+    console.log('📦 [BACKEND] Dados recebidos:', { nome, descricao, ativo });
+    
     // Allow masters and the user themselves to manage their own data
     if (req.user.role !== 'master' && req.user.uid !== userId) {
+        console.log('❌ [BACKEND] Acesso negado - usuário não autorizado');
         return res.status(403).json({ error: 'Acesso negado.' });
     }
 
     if (!nome || !descricao) {
+        console.log('❌ [BACKEND] Validação falhou - campos obrigatórios');
         return res.status(400).json({ error: 'Nome e descrição são obrigatórios.' });
     }
 
     try {
+        console.log('🔌 [BACKEND] Conectando ao banco de dados...');
         const client = await db.pool.connect();
         
         // Verificar se já existe um kit pai com o mesmo nome para este usuário
+        console.log('🔍 [BACKEND] Verificando duplicatas...');
         const existingKit = await client.query(
             'SELECT id FROM public.kit_parents WHERE user_id = $1 AND nome = $2',
             [userId, nome]
         );
 
         if (existingKit.rows.length > 0) {
+            console.log('⚠️ [BACKEND] Kit duplicado encontrado');
             client.release();
             return res.status(400).json({ error: 'Já existe um kit pai com este nome.' });
         }
 
+        console.log('✅ [BACKEND] Inserindo novo kit pai...');
         const insertQuery = `
             INSERT INTO public.kit_parents (user_id, nome, descricao, ativo)
             VALUES ($1, $2, $3, $4)
@@ -130,10 +141,11 @@ router.post('/user/:userId', authenticateToken, async (req, res) => {
         
         const result = await client.query(insertQuery, [userId, nome, descricao, ativo]);
         client.release();
-
+        
+        console.log('🎉 [BACKEND] Kit pai criado com sucesso:', result.rows[0]);
         res.status(201).json(result.rows[0]);
     } catch (error) {
-        console.error('Erro ao criar kit pai:', error);
+        console.error('💥 [BACKEND] Erro ao criar kit pai:', error);
         res.status(500).json({ error: 'Erro interno ao criar kit pai.' });
     }
 });

@@ -77,6 +77,7 @@ const schema = {
             package_type_id INTEGER REFERENCES public.package_types(id) ON DELETE SET NULL,
             kit_parent_id INTEGER,
             is_kit BOOLEAN DEFAULT FALSE,
+            ativo BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP WITH TIME ZONE,
             UNIQUE (user_id, sku)
@@ -90,6 +91,8 @@ const schema = {
             quantity_change INTEGER NOT NULL,
             reason TEXT,
             related_sale_id BIGINT,
+            package_type_id INTEGER REFERENCES public.package_types(id),
+            package_type_context TEXT,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );`,
     user_contracts: `
@@ -217,6 +220,11 @@ async function syncDatabaseSchema() {
                         console.log(`   -> Adicionando coluna 'kit_parent_id' à tabela: public.skus`);
                         await client.query('ALTER TABLE public.skus ADD COLUMN kit_parent_id INTEGER;');
                     }
+                    const ativoColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'skus' AND column_name = 'ativo'`);
+                    if (ativoColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'ativo' à tabela: public.skus`);
+                        await client.query('ALTER TABLE public.skus ADD COLUMN ativo BOOLEAN DEFAULT TRUE;');
+                    }
                 }
                 if (tableName === 'kit_parents') {
                     // Criar índice para otimizar buscas por user_id na tabela kit_parents
@@ -229,6 +237,21 @@ async function syncDatabaseSchema() {
                     if (indexCheck.rowCount === 0) {
                         console.log(`   -> Criando índice 'idx_kit_parents_user_id' na tabela: public.kit_parents`);
                         await client.query('CREATE INDEX idx_kit_parents_user_id ON public.kit_parents(user_id);');
+                    }
+                }
+                if (tableName === 'stock_movements') {
+                    // Verifica e adiciona a coluna 'package_type_id' se não existir
+                    const packageTypeColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'stock_movements' AND column_name = 'package_type_id'`);
+                    if (packageTypeColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'package_type_id' à tabela: public.stock_movements`);
+                        await client.query('ALTER TABLE public.stock_movements ADD COLUMN package_type_id INTEGER REFERENCES public.package_types(id);');
+                    }
+                    
+                    // Verifica e adiciona a coluna 'package_type_context' se não existir
+                    const packageContextColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'stock_movements' AND column_name = 'package_type_context'`);
+                    if (packageContextColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'package_type_context' à tabela: public.stock_movements`);
+                        await client.query('ALTER TABLE public.stock_movements ADD COLUMN package_type_context TEXT;');
                     }
                 }
             }
