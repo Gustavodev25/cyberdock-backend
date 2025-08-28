@@ -64,3 +64,5 @@ async function checkAndRunMigration() {
 }
 
 checkAndRunMigration().catch(console.error);
+
+

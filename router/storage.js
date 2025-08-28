@@ -111,34 +111,111 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, as
 
     const masterBasePrice = masterPrices['base_storage'] || 0;
     const masterAdditionalPrice = masterPrices['additional_storage'] || 0;
+    
+    // === DEBUG: Log dos preços master ===
+    console.log('🔍 DEBUG - Preços master:');
+    console.log('Query:', masterPricesQuery);
+    console.log('Resultados:', JSON.stringify(masterPricesResult.rows, null, 2));
+    console.log(`• masterBasePrice: R$ ${masterBasePrice.toFixed(2)}`);
+    console.log(`• masterAdditionalPrice: R$ ${masterAdditionalPrice.toFixed(2)}`);
 
     const contractsQuery = `
-      SELECT s.type, uc.volume
+      SELECT s.type, uc.volume, uc.start_date
       FROM public.user_contracts uc
       JOIN public.services s ON uc.service_id = s.id
-      WHERE uc.uid = $1 AND s.type IN ('base_storage', 'additional_storage');
+      WHERE uc.uid = $1 AND s.type IN ('base_storage', 'additional_storage', 'proportional_storage');
     `;
     const contractsResult = await db.query(contractsQuery, [userId]);
+    
+    // === DEBUG: Log dos contratos encontrados ===
+    console.log('🔍 DEBUG - Contratos encontrados:');
+    console.log('Query:', contractsQuery);
+    console.log('User ID:', userId);
+    console.log('Resultados:', JSON.stringify(contractsResult.rows, null, 2));
 
     let totalCost = 0, baseCost = 0, additionalCost = 0, additionalVolume = 0;
 
+    // === BUSCAR TODOS OS TIPOS DE CONTRATOS ===
     const baseService = contractsResult.rows.find(c => c.type === 'base_storage');
-    if (baseService) baseCost = masterBasePrice;
+    const proportionalService = contractsResult.rows.find(c => c.type === 'proportional_storage');
+    const additionalService = contractsResult.rows.find(c => c.type === 'additional_storage');
+    
+    console.log('🔍 DEBUG - Serviços encontrados:');
+    console.log('• Base:', baseService);
+    console.log('• Proporcional:', proportionalService);
+    console.log('• Adicional:', additionalService);
+    
+    // === LÓGICA PARA ARMAZENAMENTO BASE/PROPORCIONAL ===
+    if (proportionalService) {
+      // === USUÁRIO TEM CONTRATO PROPORCIONAL (primeiro mês) ===
+      const contractStartDate = new Date(proportionalService.start_date);
+      const currentDate = new Date();
+      
+      // Calcular dias restantes no mês
+      const today = currentDate.getDate();
+      const daysInMonth = new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 0).getDate();
+      const daysRemaining = daysInMonth - today + 1;
+      
+      // Cálculo: 397 ÷ 30 × dias restantes
+      const dailyRate = masterBasePrice / 30;
+      baseCost = dailyRate * daysRemaining;
+      
+      console.log('🔍 DEBUG - Cálculo base (PROPORCIONAL - primeiro mês):');
+      console.log(`• Serviço usado: Armazenamento Proporcional`);
+      console.log(`• Data do contrato: ${contractStartDate.toLocaleDateString('pt-BR')}`);
+      console.log(`• Mês atual: ${currentDate.toLocaleDateString('pt-BR')}`);
+      console.log(`• Dias restantes: ${daysRemaining}`);
+      console.log(`• Taxa diária: R$ ${dailyRate.toFixed(2)}`);
+      console.log(`• Custo base (PROPORCIONAL): R$ ${baseCost.toFixed(2)}`);
+      console.log(`• NOTA: Usando contrato proporcional`);
+      
+    } else if (baseService) {
+      // === USUÁRIO TEM CONTRATO BASE (meses seguintes) ===
+      baseCost = masterBasePrice;
+      
+      console.log('🔍 DEBUG - Cálculo base (BASE - meses seguintes):');
+      console.log(`• Serviço usado: Armazenamento Base (até 1m³)`);
+      console.log(`• Custo base (COMPLETO): R$ ${baseCost.toFixed(2)}`);
+      console.log(`• NOTA: Usando contrato base (valor integral)`);
+      
+    } else {
+      console.log('🔍 DEBUG - Nenhum serviço base/proporcional encontrado');
+    }
 
-    const additionalServiceContract = contractsResult.rows.find(c => c.type === 'additional_storage');
-    if (additionalServiceContract) {
-      const quantity = parseInt(additionalServiceContract.volume, 10) || 0;
+    if (additionalService) {
+      const quantity = parseInt(additionalService.volume, 10) || 0;
+      // === CORREÇÃO: Armazenamento adicional é sempre valor completo ===
+      // Não é proporcional como o base
       additionalCost = masterAdditionalPrice * quantity;
       additionalVolume = quantity;
+      
+      console.log('🔍 DEBUG - Cálculo adicional:');
+      console.log(`• Volume: ${quantity}`);
+      console.log(`• Preço por m³: R$ ${masterAdditionalPrice.toFixed(2)}`);
+      console.log(`• Custo adicional (COMPLETO): R$ ${additionalCost.toFixed(2)}`);
+      console.log(`• NOTA: Armazenamento adicional sempre cobra valor integral`);
+    } else {
+      console.log('🔍 DEBUG - Nenhum serviço adicional encontrado');
     }
 
     totalCost = baseCost + additionalCost;
+    
+    // === DEBUG: Log dos valores calculados ===
+    console.log('🔍 DEBUG - Valores calculados:');
+    console.log(`• baseCost: R$ ${baseCost.toFixed(2)}`);
+    console.log(`• additionalCost: R$ ${additionalCost.toFixed(2)}`);
+    console.log(`• totalCost: R$ ${totalCost.toFixed(2)}`);
+    console.log(`• additionalVolume: ${additionalVolume} m³`);
 
     // === NOVA LÓGICA: Cálculo de armazenamento mensal proporcional ===
     const now = new Date();
     const currentYear = now.getUTCFullYear();
     const currentMonth = now.getUTCMonth();
     const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+    
+    // === CÁLCULO DE ARMAZENAMENTO PROPORCIONAL ESPECÍFICO PARA 21/08 ===
+    const august21Date = new Date(2024, 7, 21); // 21 de agosto de 2024 (mês 7 = agosto)
+    const isAugust2024 = currentYear === 2024 && currentMonth === 7;
     
     const monthlyStorageQuery = `
       SELECT 
@@ -167,8 +244,25 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, as
       const startYear = startDate.getUTCFullYear();
       const startMonth = startDate.getUTCMonth();
       
-      // Se o SKU foi criado no mês atual
-      if (startYear === currentYear && startMonth === currentMonth) {
+      // === LÓGICA ESPECIAL PARA AGOSTO 2024 - CÁLCULO PROPORCIONAL A PARTIR DE 21/08 ===
+      if (isAugust2024 && startDate >= august21Date) {
+        // SKU iniciado em 21/08 ou depois - cálculo proporcional para agosto
+        const startDay = startDate.getUTCDate();
+        const daysInAugust = daysInMonth - startDay + 1;
+        const proportionalPrice = (sku.monthly_price / daysInMonth) * daysInAugust;
+        
+        monthlyStorageCost += proportionalPrice;
+        monthlyStorageDetails.push({
+          sku: sku.sku,
+          descricao: sku.descricao,
+          monthlyPrice: parseFloat(sku.monthly_price),
+          startDate: sku.monthly_start_date,
+          daysInMonth: daysInAugust,
+          proportionalPrice: Math.round(proportionalPrice * 100) / 100,
+          tipo: 'proporcional_agosto_21'
+        });
+      } else if (startYear === currentYear && startMonth === currentMonth) {
+        // Se o SKU foi criado no mês atual (outros meses)
         const startDay = startDate.getUTCDate();
         const daysInCurrentMonth = daysInMonth - startDay + 1;
         const proportionalPrice = (sku.monthly_price / daysInMonth) * daysInCurrentMonth;
@@ -180,7 +274,8 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, as
           monthlyPrice: parseFloat(sku.monthly_price),
           startDate: sku.monthly_start_date,
           daysInMonth: daysInCurrentMonth,
-          proportionalPrice: Math.round(proportionalPrice * 100) / 100
+          proportionalPrice: Math.round(proportionalPrice * 100) / 100,
+          tipo: 'proporcional_mes_atual'
         });
       } else {
         // SKU de meses anteriores - cobrar preço completo
@@ -191,7 +286,8 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, as
           monthlyPrice: parseFloat(sku.monthly_price),
           startDate: sku.monthly_start_date,
           daysInMonth: daysInMonth,
-          proportionalPrice: parseFloat(sku.monthly_price)
+          proportionalPrice: parseFloat(sku.monthly_price),
+          tipo: 'mes_completo'
         });
       }
     }

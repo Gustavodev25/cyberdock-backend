@@ -283,12 +283,13 @@ async function seedInitialData() {
             );
         }
 
-        const servicesCheck = await client.query("SELECT COUNT(*) FROM public.services WHERE type IN ('base_storage', 'additional_storage', 'avulso_simples', 'avulso_quantidade')");
-        if (parseInt(servicesCheck.rows[0].count, 10) < 5) {
+        const servicesCheck = await client.query("SELECT COUNT(*) FROM public.services WHERE type IN ('base_storage', 'additional_storage', 'avulso_simples', 'avulso_quantidade', 'proportional_storage')");
+        if (parseInt(servicesCheck.rows[0].count, 10) < 6) {
             console.log('Serviços não encontrados ou incompletos. Inserindo/Atualizando...');
             
-            await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Armazenamento Base (até 1m³)', 397.00, 'Taxa base de armazenamento para o primeiro metro cúbico.', 'base_storage'), ('Metro Cúbico Adicional', 197.00, 'Custo por cada metro cúbico adicional utilizado.', 'additional_storage') ON CONFLICT (name) DO NOTHING;`);
+            await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Armazenamento Base (até 1m³)', 397.00, 'Taxa base de armazenamento para o primeiro metro cúbico. Cobrança proporcional por dia (397/30).', 'base_storage'), ('Metro Cúbico Adicional', 197.00, 'Custo por cada metro cúbico adicional utilizado.', 'additional_storage') ON CONFLICT (name) DO NOTHING;`);
             await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Coleta CyberSegura', 50.00, 'Serviço de coleta avulso.', 'avulso_simples'), ('Transbordo Full CyberSeguro', 75.00, 'Serviço de transbordo avulso.', 'avulso_simples') ON CONFLICT (name) DO NOTHING;`);
+            await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Armazenamento Proporcional', 0.00, 'Serviço de armazenamento com cobrança proporcional a partir de data específica.', 'proportional_storage') ON CONFLICT (name) DO NOTHING;`);
 
             const montagemFullConfig = { tiers: [ { from: 1, to: 100, price: 1.49 }, { from: 101, to: 300, price: 1.29 }, { from: 301, to: null, price: 1.09 } ] };
             await client.query(`INSERT INTO public.services (name, price, description, type, config) VALUES ('Montagem de Full', 0, 'Montagem de pacotes para envio Full. O preço varia com a quantidade.', 'avulso_quantidade', $1) ON CONFLICT (name) DO UPDATE SET config = EXCLUDED.config;`, [JSON.stringify(montagemFullConfig)]);

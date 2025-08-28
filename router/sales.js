@@ -92,11 +92,40 @@ function buildInsertBatchRows(orders, targetUid, nickname) {
       const sku = it?.item?.seller_sku || it?.item?.id || null;
       if (!sku) continue;
 
+      // Garantir que seller_id seja um número válido
+      let sellerId = order?.seller?.id;
+      if (sellerId) {
+        sellerId = parseInt(sellerId, 10);
+        if (isNaN(sellerId)) {
+          console.warn(`seller_id inválido para pedido ${order.id}: ${order?.seller?.id}`);
+          sellerId = null;
+        }
+      }
+
+      // Garantir que o ID do pedido seja um número válido
+      let orderId = order.id;
+      if (orderId && typeof orderId === 'string') {
+        orderId = parseInt(orderId, 10);
+        if (isNaN(orderId)) {
+          console.warn(`ID do pedido inválido: ${order.id}`);
+          continue; // Pular este pedido se o ID for inválido
+        }
+      }
+
+      // Garantir que packages seja um número válido
+      let packages = order.pack_id ? 1 : 0;
+      if (packages && typeof packages === 'string') {
+        packages = parseInt(packages, 10);
+        if (isNaN(packages)) {
+          packages = 0;
+        }
+      }
+
       rows.push({
-        id: order.id,
+        id: orderId,
         sku,
         uid: targetUid,
-        seller_id: order?.seller?.id,
+        seller_id: sellerId,
         channel: 'ML',
         account_nickname: nickname || null,
         sale_date: order.date_created,
@@ -104,7 +133,7 @@ function buildInsertBatchRows(orders, targetUid, nickname) {
         quantity: it?.quantity || 1,
         shipping_mode: finalShippingMode,
         shipping_limit_date: finalShippingLimitDate,
-        packages: order.pack_id ? 1 : 0,
+        packages: packages,
         raw_api_data: order
       });
     }
@@ -123,10 +152,47 @@ function buildMultiInsertQuery_DoUpdate(rows) {
   let p = 1;
 
   for (const r of rows) {
+    // Garantir que todos os campos numéricos sejam do tipo correto
+    let id = r.id;
+    if (id && typeof id === 'string') {
+      id = parseInt(id, 10);
+      if (isNaN(id)) {
+        console.warn(`id inválido para inserção: ${r.id}`);
+        continue; // Pular esta linha se o ID for inválido
+      }
+    }
+
+    let sellerId = r.seller_id;
+    if (sellerId && typeof sellerId === 'string') {
+      sellerId = parseInt(sellerId, 10);
+      if (isNaN(sellerId)) {
+        console.warn(`seller_id inválido para inserção: ${r.seller_id}`);
+        sellerId = null;
+      }
+    }
+
+    let quantity = r.quantity;
+    if (quantity && typeof quantity === 'string') {
+      quantity = parseInt(quantity, 10);
+      if (isNaN(quantity)) {
+        console.warn(`quantity inválido para inserção: ${r.quantity}`);
+        quantity = 1;
+      }
+    }
+
+    let packages = r.packages;
+    if (packages && typeof packages === 'string') {
+      packages = parseInt(packages, 10);
+      if (isNaN(packages)) {
+        console.warn(`packages inválido para inserção: ${r.packages}`);
+        packages = 0;
+      }
+    }
+
     params.push(
-      r.id, r.sku, r.uid, r.seller_id, 'ML', r.account_nickname,
-      r.sale_date, r.product_title, r.quantity, r.shipping_mode,
-      r.shipping_limit_date, r.packages, r.raw_api_data,
+      id, r.sku, r.uid, sellerId, 'ML', r.account_nickname,
+      r.sale_date, r.product_title, quantity, r.shipping_mode,
+      r.shipping_limit_date, packages, r.raw_api_data,
       new Date()
     );
     const placeholders = cols.map(() => `$${p++}`).join(', ');
@@ -172,11 +238,30 @@ function buildMultiUpdateQuery_Backfill(rows) {
   let p = 1;
 
   for (const r of rows) {
+    // Garantir que todos os campos numéricos sejam do tipo correto
+    let id = r.id;
+    if (id && typeof id === 'string') {
+      id = parseInt(id, 10);
+      if (isNaN(id)) {
+        console.warn(`id inválido para backfill: ${r.id}`);
+        continue; // Pular esta linha se o ID for inválido
+      }
+    }
+
+    let packages = r.packages;
+    if (packages && typeof packages === 'string') {
+      packages = parseInt(packages, 10);
+      if (isNaN(packages)) {
+        console.warn(`packages inválido para backfill: ${r.packages}`);
+        packages = null;
+      }
+    }
+
     params.push(
-      r.id, r.sku, r.uid,
+      id, r.sku, r.uid,
       r.shipping_mode ?? null,
       r.shipping_limit_date ?? null,
-      r.packages ?? null,
+      packages,
       r.raw_api_data ?? null,
       new Date()
     );
@@ -189,19 +274,19 @@ function buildMultiUpdateQuery_Backfill(rows) {
       VALUES ${values.join(', ')}
     )
     UPDATE public.sales s
-       SET shipping_mode = CASE 
+       SET shipping_mode = CASE
                               WHEN s.shipping_mode IS NULL OR s.shipping_mode = 'Outros'
                               THEN d.shipping_mode
                               ELSE s.shipping_mode
                            END,
-           shipping_limit_date = COALESCE(s.shipping_limit_date, d.shipping_limit_date),
-           packages           = COALESCE(s.packages, d.packages),
-           raw_api_data       = COALESCE(d.raw_api_data, s.raw_api_data),
-           updated_at         = GREATEST(COALESCE(s.updated_at, d.updated_at), d.updated_at)
+           shipping_limit_date = COALESCE(s.shipping_limit_date, d.shipping_limit_date::timestamp with time zone),
+           packages           = COALESCE(s.packages, d.packages::integer),
+           raw_api_data       = COALESCE(d.raw_api_data::jsonb, s.raw_api_data),
+           updated_at         = GREATEST(COALESCE(s.updated_at, d.updated_at::timestamp with time zone), d.updated_at::timestamp with time zone)
       FROM data d
-     WHERE s.id = d.id
-       AND s.sku = d.sku
-       AND s.uid = d.uid;
+     WHERE s.id = d.id::bigint
+       AND s.sku = d.sku::text
+       AND s.uid = d.uid::text;
   `;
   return { query, params };
 }
@@ -302,7 +387,44 @@ async function runBackfillMissing({ db, clientId, nickname, targetUid, userId, a
   const allowed = new Set(cand.rows.map(r => `${r.id}::${r.sku}::${r.uid}`));
   const rowsRaw = buildInsertBatchRows(detailedOrders.filter(Boolean), targetUid, nickname)
     .filter(r => allowed.has(`${r.id}::${r.sku}::${r.uid}`));
-  const rows = uniqByIdSku(rowsRaw);
+  
+  // Garantir que todos os campos numéricos sejam do tipo correto para todas as linhas
+  const rows = uniqByIdSku(rowsRaw).map(r => {
+    // Converter ID para número
+    if (r.id && typeof r.id === 'string') {
+      const parsedId = parseInt(r.id, 10);
+      if (!isNaN(parsedId)) {
+        r.id = parsedId;
+      } else {
+        console.warn(`id inválido no backfill: ${r.id}`);
+        return null; // Retornar null para filtrar esta linha
+      }
+    }
+
+    // Converter seller_id para número
+    if (r.seller_id && typeof r.seller_id === 'string') {
+      const parsedSellerId = parseInt(r.seller_id, 10);
+      if (!isNaN(parsedSellerId)) {
+        r.seller_id = parsedSellerId;
+      } else {
+        console.warn(`seller_id inválido no backfill: ${r.seller_id}`);
+        r.seller_id = null;
+      }
+    }
+
+    // Converter packages para número
+    if (r.packages && typeof r.packages === 'string') {
+      const parsedPackages = parseInt(r.packages, 10);
+      if (!isNaN(parsedPackages)) {
+        r.packages = parsedPackages;
+      } else {
+        console.warn(`packages inválido no backfill: ${r.packages}`);
+        r.packages = null;
+      }
+    }
+
+    return r;
+  }).filter(Boolean); // Remover linhas com ID inválido
 
   if (rows.length === 0) {
     sendEvent(clientId, { progress: 72, message: `[${nickname}] Nada a atualizar após o enriquecimento.`, type: 'info' });
@@ -779,8 +901,7 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
 
 router.post('/sync-account', authenticateToken, async (req, res) => {
   const { userId, accountNickname: nickname, clientId, force, backfill, clientUid } = req.body;
-  const masterUid = req.user.uid;
-  const targetUid = clientUid || masterUid;
+  let targetUid = clientUid || req.user.uid;
 
   if (!userId || !clientId) return res.status(400).json({ error: 'ID usuário e clientId obrigatórios.' });
 
@@ -789,18 +910,45 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
   try {
     sendEvent(clientId, { progress: 10, message: `[${nickname}] Buscando credenciais...`, type: 'info' });
     
-    // Se for master, busca a conta diretamente pelo uid, sem restrição de user_id
-    let accQ, accRes;
+    // Resolver credenciais da conta ML (permitir MASTER sincronizar sem estar logado no dono)
+    let access_token, refresh_token;
     if (req.user.role === 'master') {
-      accQ = 'SELECT access_token, refresh_token FROM public.ml_accounts WHERE uid = $1';
-      accRes = await db.query(accQ, [targetUid]);
+      if (clientUid) {
+        const accRes = await db.query(
+          'SELECT access_token, refresh_token FROM public.ml_accounts WHERE user_id = $1 AND uid = $2',
+          [userId, clientUid]
+        );
+        if (accRes.rowCount === 0) {
+          // Fallback: localizar pela conta ML (seller_id) e deduzir o UID do dono
+          const fallback = await db.query(
+            'SELECT access_token, refresh_token, uid FROM public.ml_accounts WHERE user_id = $1 LIMIT 1',
+            [userId]
+          );
+          if (fallback.rowCount === 0) throw new Error('Conta ML não encontrada.');
+          ({ access_token, refresh_token } = fallback.rows[0]);
+          targetUid = fallback.rows[0].uid;
+        } else {
+          ({ access_token, refresh_token } = accRes.rows[0]);
+          targetUid = clientUid;
+        }
+      } else {
+        // MASTER sem clientUid: localizar pela conta ML (seller_id) e deduzir o UID do dono
+        const accRes = await db.query(
+          'SELECT access_token, refresh_token, uid FROM public.ml_accounts WHERE user_id = $1 LIMIT 1',
+          [userId]
+        );
+        if (accRes.rowCount === 0) throw new Error('Conta ML não encontrada.');
+        ({ access_token, refresh_token } = accRes.rows[0]);
+        targetUid = accRes.rows[0].uid;
+      }
     } else {
-      accQ = 'SELECT access_token, refresh_token FROM public.ml_accounts WHERE user_id = $1 AND uid = $2';
-      accRes = await db.query(accQ, [userId, targetUid]);
+      const accRes = await db.query(
+        'SELECT access_token, refresh_token FROM public.ml_accounts WHERE user_id = $1 AND uid = $2',
+        [userId, targetUid]
+      );
+      if (accRes.rowCount === 0) throw new Error('Conta ML não encontrada ou não pertence ao usuário.');
+      ({ access_token, refresh_token } = accRes.rows[0]);
     }
-    
-    if (accRes.rowCount === 0) throw new Error('Conta ML não encontrada ou não pertence ao usuário.');
-    let { access_token, refresh_token } = accRes.rows[0];
 
     if (backfill) {
       await runBackfillMissing({ 
@@ -855,7 +1003,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       const limit = Math.min(PAGE_LIMIT, MAX_ORDERS - orderSummaries.length);
       const ordersUrl =
         `https://api.mercadolibre.com/orders/search` +
-        `?seller=${targetUid}&offset=${offset}&limit=${limit}&sort=date_desc` +
+        `?seller=${userId}&offset=${offset}&limit=${limit}&sort=date_desc` +
         `&order.date_created.from=${encodeURIComponent(lastSyncDate.toISOString())}`;
 
       let ordersResponse = await fetch(ordersUrl, { headers: { Authorization: `Bearer ${access_token}` } });
@@ -887,8 +1035,8 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         refresh_token = newTokenData.refresh_token;
         if (req.user.role === 'master') {
           await db.query(
-            'UPDATE public.ml_accounts SET access_token = $1, refresh_token = $2, expires_in = $3, status = \'active\', updated_at = NOW() WHERE uid = $4',
-            [access_token, refresh_token, newTokenData.expires_in, targetUid]
+            'UPDATE public.ml_accounts SET access_token = $1, refresh_token = $2, expires_in = $3, status = \'active\', updated_at = NOW() WHERE user_id = $4 AND uid = $5',
+            [access_token, refresh_token, newTokenData.expires_in, userId, targetUid]
           );
         } else {
           await db.query(
@@ -902,7 +1050,24 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
 
       if (!ordersResponse.ok) {
         const errorBody = await safeJson(ordersResponse);
-        throw new Error(`Erro na API do Mercado Livre: ${errorBody?.message || ordersResponse.statusText}`);
+        const errorMessage = errorBody?.message || ordersResponse.statusText;
+        
+        // Tratamento específico para erro de permissão
+        if (errorMessage.includes('caller.id does not match buyer or seller')) {
+          console.error(`[${nickname}] Erro de permissão na API: ${errorMessage}`);
+          sendEvent(clientId, {
+            progress: 0,
+            message: `[${nickname}] Erro de permissão: Token e conta não correspondem (caller.id mismatch). Verifique se está sincronizando a conta correta. Não é necessário reconectar.`,
+            type: 'error'
+          });
+          
+          // Marcar conta como necessitando reconexão
+          // Não marque a conta para reconexão para este erro específico,
+          // pois normalmente é causado por parâmetro 'seller' incorreto (account mismatch).
+          throw new Error(`Erro de permissão na API do Mercado Livre: ${errorMessage}. Verifique se a conta selecionada corresponde ao token conectado (seller_id incorreto). O status da conta não foi alterado.`);
+        }
+        
+        throw new Error(`Erro na API do Mercado Livre: ${errorMessage}`);
       }
 
       const pageData = await ordersResponse.json();
@@ -993,7 +1158,12 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         }
       }
       await clientDb.query('COMMIT');
-      sendEvent(clientId, { progress: 100, message: `[${nickname}] Sincronização concluída. ${allRows.length} itens processados.`, type: 'success' });
+      sendEvent(clientId, { 
+        progress: 100, 
+        message: `[${nickname}] Sincronização concluída. ${allRows.length} itens processados.`, 
+        type: 'success',
+        newSalesCount: allRows.length
+      });
     } catch (e) {
       await clientDb.query('ROLLBACK');
       throw e;
@@ -1008,6 +1178,44 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       clients[clientId].res.end();
       delete clients[clientId];
     }
+  }
+});
+
+// Endpoint para verificar a última sincronização de uma conta
+router.get('/last-sync/:mlAccountId', authenticateToken, async (req, res) => {
+  try {
+    const { mlAccountId } = req.params;
+    let targetUid = req.query.clientUid || req.user.uid;
+
+    if (!mlAccountId) {
+      return res.status(400).json({ error: 'ID da conta ML é obrigatório.' });
+    }
+
+    // Se MASTER e nenhum clientUid informado, descobrir automaticamente o dono da conta ML
+    if (req.user.role === 'master' && !req.query.clientUid) {
+      const owner = await db.query('SELECT uid FROM public.ml_accounts WHERE user_id = $1 LIMIT 1', [mlAccountId]);
+      if (owner.rowCount > 0) {
+        targetUid = owner.rows[0].uid;
+      }
+    }
+
+    // Busca a última venda sincronizada para esta conta
+    const lastSyncRes = await db.query(
+      `SELECT MAX(sale_date) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
+      [targetUid, mlAccountId]
+    );
+ 
+    const lastSync = lastSyncRes.rows[0]?.last_sale;
+    
+    res.json({
+      lastSync: lastSync ? lastSync.toISOString() : null,
+      accountId: mlAccountId,
+      message: lastSync ? 'Última sincronização encontrada' : 'Nunca sincronizada'
+    });
+
+  } catch (error) {
+    console.error('Erro ao verificar última sincronização:', error);
+    res.status(500).json({ error: 'Erro interno do servidor' });
   }
 });
 

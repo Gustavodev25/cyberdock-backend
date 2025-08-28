@@ -18,7 +18,7 @@ async function calculateAndSaveInvoice(client, uid, period) {
   const masterPricesRes = await client.query(`
     SELECT type, price
     FROM public.services
-    WHERE type IN ('base_storage', 'additional_storage');
+    WHERE type IN ('base_storage', 'additional_storage', 'proportional_storage');
   `);
   const masterPrices = masterPricesRes.rows.reduce((acc, s) => {
     acc[s.type] = parseFloat(s.price);
@@ -26,6 +26,7 @@ async function calculateAndSaveInvoice(client, uid, period) {
   }, {});
   const masterBasePrice = masterPrices['base_storage'] || 0;
   const masterAdditionalPrice = masterPrices['additional_storage'] || 0;
+  const masterProportionalPrice = masterPrices['proportional_storage'] || 0;
 
   // === 2) Contratos do cliente para armazenamento ===
   const contractsRes = await client.query(`
@@ -40,14 +41,40 @@ async function calculateAndSaveInvoice(client, uid, period) {
 
   const baseService = contractsRes.rows.find(c => c.type === 'base_storage');
   if (baseService) {
-    autoItems.push({
-      description: 'Armazenamento Base (até 1m³)',
-      quantity: 1,
-      unit_price: masterBasePrice,
-      total_price: masterBasePrice,
-      type: 'storage'
-    });
-    autoTotal += masterBasePrice;
+    // === CÁLCULO PROPORCIONAL: R$ 397,00 ÷ 30 dias × dias restantes no mês ===
+    const currentDate = new Date();
+    const currentYear = currentDate.getFullYear();
+    const currentMonth = currentDate.getMonth();
+    
+    // Se for o mês atual, calcular proporcional
+    if (year === currentYear && month === currentMonth + 1) {
+      const today = currentDate.getDate();
+      const daysInMonth = new Date(year, month, 0).getDate();
+      const daysRemaining = daysInMonth - today + 1;
+      
+      // Cálculo: 397 ÷ 30 × dias restantes
+      const dailyRate = masterBasePrice / 30;
+      const proportionalPrice = dailyRate * daysRemaining;
+      
+      autoItems.push({
+        description: `Armazenamento Base (até 1m³) - Proporcional ${daysRemaining} dias`,
+        quantity: 1,
+        unit_price: Math.round(proportionalPrice * 100) / 100,
+        total_price: Math.round(proportionalPrice * 100) / 100,
+        type: 'storage'
+      });
+      autoTotal += Math.round(proportionalPrice * 100) / 100;
+    } else {
+      // Mês completo ou meses anteriores
+      autoItems.push({
+        description: 'Armazenamento Base (até 1m³)',
+        quantity: 1,
+        unit_price: masterBasePrice,
+        total_price: masterBasePrice,
+        type: 'storage'
+      });
+      autoTotal += masterBasePrice;
+    }
   }
 
   const additionalService = contractsRes.rows.find(c => c.type === 'additional_storage');
@@ -65,6 +92,10 @@ async function calculateAndSaveInvoice(client, uid, period) {
       autoTotal += total;
     }
   }
+
+  // === 2.1) CÁLCULO PROPORCIONAL AUTOMÁTICO ===
+  // O armazenamento base já é calculado proporcionalmente acima
+  // Para meses futuros, será cobrado o valor completo
 
   // === 3) Expedições por período ===
   const shipmentsRes = await client.query(`
