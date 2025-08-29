@@ -142,6 +142,7 @@ const schema = {
             child_sku_id INTEGER NOT NULL REFERENCES public.skus(id) ON DELETE CASCADE,
             quantity_per_kit INTEGER NOT NULL DEFAULT 1,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             UNIQUE (kit_sku_id, child_sku_id)
         );`,
     kit_parents: `
@@ -226,6 +227,13 @@ async function syncDatabaseSchema() {
                         await client.query('ALTER TABLE public.skus ADD COLUMN ativo BOOLEAN DEFAULT TRUE;');
                     }
                 }
+                if (tableName === 'sku_kit_components') {
+                    const updatedAtColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sku_kit_components' AND column_name = 'updated_at'`);
+                    if (updatedAtColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'updated_at' à tabela: public.sku_kit_components`);
+                        await client.query('ALTER TABLE public.sku_kit_components ADD COLUMN updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;');
+                    }
+                }
                 if (tableName === 'kit_parents') {
                     // Criar índice para otimizar buscas por user_id na tabela kit_parents
                     const indexCheck = await client.query(`
@@ -283,13 +291,12 @@ async function seedInitialData() {
             );
         }
 
-        const servicesCheck = await client.query("SELECT COUNT(*) FROM public.services WHERE type IN ('base_storage', 'additional_storage', 'avulso_simples', 'avulso_quantidade', 'proportional_storage')");
-        if (parseInt(servicesCheck.rows[0].count, 10) < 6) {
+        const servicesCheck = await client.query("SELECT COUNT(*) FROM public.services WHERE type IN ('base_storage', 'additional_storage', 'avulso_simples', 'avulso_quantidade')");
+        if (parseInt(servicesCheck.rows[0].count, 10) < 5) {
             console.log('Serviços não encontrados ou incompletos. Inserindo/Atualizando...');
             
-            await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Armazenamento Base (até 1m³)', 397.00, 'Taxa base de armazenamento para o primeiro metro cúbico. Cobrança proporcional por dia (397/30).', 'base_storage'), ('Metro Cúbico Adicional', 197.00, 'Custo por cada metro cúbico adicional utilizado.', 'additional_storage') ON CONFLICT (name) DO NOTHING;`);
+            await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Armazenamento Base (até 1m³)', 397.00, 'Taxa base de armazenamento para o primeiro metro cúbico. Cobrança proporcional baseada na data de entrada do usuário.', 'base_storage'), ('Metro Cúbico Adicional', 197.00, 'Custo por cada metro cúbico adicional utilizado.', 'additional_storage') ON CONFLICT (name) DO NOTHING;`);
             await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Coleta CyberSegura', 50.00, 'Serviço de coleta avulso.', 'avulso_simples'), ('Transbordo Full CyberSeguro', 75.00, 'Serviço de transbordo avulso.', 'avulso_simples') ON CONFLICT (name) DO NOTHING;`);
-            await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Armazenamento Proporcional', 0.00, 'Serviço de armazenamento com cobrança proporcional a partir de data específica.', 'proportional_storage') ON CONFLICT (name) DO NOTHING;`);
 
             const montagemFullConfig = { tiers: [ { from: 1, to: 100, price: 1.49 }, { from: 101, to: 300, price: 1.29 }, { from: 301, to: null, price: 1.09 } ] };
             await client.query(`INSERT INTO public.services (name, price, description, type, config) VALUES ('Montagem de Full', 0, 'Montagem de pacotes para envio Full. O preço varia com a quantidade.', 'avulso_quantidade', $1) ON CONFLICT (name) DO UPDATE SET config = EXCLUDED.config;`, [JSON.stringify(montagemFullConfig)]);

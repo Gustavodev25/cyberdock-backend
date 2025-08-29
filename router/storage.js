@@ -123,7 +123,7 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, as
       SELECT s.type, uc.volume, uc.start_date
       FROM public.user_contracts uc
       JOIN public.services s ON uc.service_id = s.id
-      WHERE uc.uid = $1 AND s.type IN ('base_storage', 'additional_storage', 'proportional_storage');
+      WHERE uc.uid = $1 AND s.type IN ('base_storage', 'additional_storage');
     `;
     const contractsResult = await db.query(contractsQuery, [userId]);
     
@@ -137,49 +137,52 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, as
 
     // === BUSCAR TODOS OS TIPOS DE CONTRATOS ===
     const baseService = contractsResult.rows.find(c => c.type === 'base_storage');
-    const proportionalService = contractsResult.rows.find(c => c.type === 'proportional_storage');
     const additionalService = contractsResult.rows.find(c => c.type === 'additional_storage');
     
     console.log('🔍 DEBUG - Serviços encontrados:');
     console.log('• Base:', baseService);
-    console.log('• Proporcional:', proportionalService);
     console.log('• Adicional:', additionalService);
     
-    // === LÓGICA PARA ARMAZENAMENTO BASE/PROPORCIONAL ===
-    if (proportionalService) {
-      // === USUÁRIO TEM CONTRATO PROPORCIONAL (primeiro mês) ===
-      const contractStartDate = new Date(proportionalService.start_date);
+        // === LÓGICA PARA ARMAZENAMENTO BASE COM CÁLCULO PROPORCIONAL ===
+    if (baseService) {
       const currentDate = new Date();
+      const contractStartDate = new Date(baseService.start_date);
+      const currentYear = currentDate.getFullYear();
+      const currentMonth = currentDate.getMonth();
+      const contractStartYear = contractStartDate.getFullYear();
+      const contractStartMonth = contractStartDate.getMonth();
       
-      // Calcular dias restantes no mês
-      const today = currentDate.getDate();
-      const daysInMonth = new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 0).getDate();
-      const daysRemaining = daysInMonth - today + 1;
-      
-      // Cálculo: 397 ÷ 30 × dias restantes
-      const dailyRate = masterBasePrice / 30;
-      baseCost = dailyRate * daysRemaining;
-      
-      console.log('🔍 DEBUG - Cálculo base (PROPORCIONAL - primeiro mês):');
-      console.log(`• Serviço usado: Armazenamento Proporcional`);
-      console.log(`• Data do contrato: ${contractStartDate.toLocaleDateString('pt-BR')}`);
-      console.log(`• Mês atual: ${currentDate.toLocaleDateString('pt-BR')}`);
-      console.log(`• Dias restantes: ${daysRemaining}`);
-      console.log(`• Taxa diária: R$ ${dailyRate.toFixed(2)}`);
-      console.log(`• Custo base (PROPORCIONAL): R$ ${baseCost.toFixed(2)}`);
-      console.log(`• NOTA: Usando contrato proporcional`);
-      
-    } else if (baseService) {
-      // === USUÁRIO TEM CONTRATO BASE (meses seguintes) ===
-      baseCost = masterBasePrice;
-      
-      console.log('🔍 DEBUG - Cálculo base (BASE - meses seguintes):');
-      console.log(`• Serviço usado: Armazenamento Base (até 1m³)`);
-      console.log(`• Custo base (COMPLETO): R$ ${baseCost.toFixed(2)}`);
-      console.log(`• NOTA: Usando contrato base (valor integral)`);
-      
+      // Se for o mês de entrada do usuário, calcular proporcional
+      if (currentYear === contractStartYear && currentMonth === contractStartMonth) {
+        // === USUÁRIO NO PRIMEIRO MÊS - CÁLCULO PROPORCIONAL ===
+        const startDay = contractStartDate.getDate();
+        const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+        const daysRemaining = daysInMonth - startDay + 1;
+        
+        // Cálculo: 397 ÷ dias no mês × dias restantes
+        const dailyRate = masterBasePrice / daysInMonth;
+        baseCost = dailyRate * daysRemaining;
+        
+        console.log('🔍 DEBUG - Cálculo base (PROPORCIONAL - primeiro mês):');
+        console.log(`• Serviço usado: Armazenamento Base (até 1m³) - Proporcional`);
+        console.log(`• Data do contrato: ${contractStartDate.toLocaleDateString('pt-BR')}`);
+        console.log(`• Mês atual: ${currentDate.toLocaleDateString('pt-BR')}`);
+        console.log(`• Dia de entrada: ${startDay}`);
+        console.log(`• Dias restantes: ${daysRemaining}`);
+        console.log(`• Taxa diária: R$ ${dailyRate.toFixed(2)}`);
+        console.log(`• Custo base (PROPORCIONAL): R$ ${baseCost.toFixed(2)}`);
+        console.log(`• NOTA: Usando contrato base com cálculo proporcional`);
+      } else {
+        // === USUÁRIO TEM CONTRATO BASE (meses seguintes) ===
+        baseCost = masterBasePrice;
+        
+        console.log('🔍 DEBUG - Cálculo base (BASE - meses seguintes):');
+        console.log(`• Serviço usado: Armazenamento Base (até 1m³)`);
+        console.log(`• Custo base (COMPLETO): R$ ${baseCost.toFixed(2)}`);
+        console.log(`• NOTA: Usando contrato base (valor integral)`);
+      }
     } else {
-      console.log('🔍 DEBUG - Nenhum serviço base/proporcional encontrado');
+      console.log('🔍 DEBUG - Nenhum serviço base encontrado');
     }
 
     if (additionalService) {
@@ -506,11 +509,16 @@ router.post('/user/:userId/skus', authenticateToken, async (req, res) => {
     monthly_start_date
   } = req.body;
 
+  console.log('🚀 [BACKEND] Criando SKU/Kit para usuário:', userId);
+  console.log('📦 [BACKEND] Dados recebidos:', { sku, descricao, is_kit, userId });
+
   if (req.user.role !== 'master' && req.user.uid !== userId) {
+    console.log('❌ [BACKEND] Acesso negado - usuário não autorizado');
     return res.status(403).json({ error: 'Acesso negado.' });
   }
 
   if (!sku || !descricao) {
+    console.log('❌ [BACKEND] Validação falhou - campos obrigatórios');
     return res.status(400).json({ error: 'SKU e Descrição são obrigatórios.' });
   }
 
@@ -527,6 +535,21 @@ router.post('/user/:userId/skus', authenticateToken, async (req, res) => {
   const client = await db.pool.connect();
   try {
     await client.query('BEGIN');
+
+    // VALIDAÇÃO ADICIONAL: Verificar se já existe um SKU com o mesmo código para este usuário
+    console.log('🔍 [BACKEND] Verificando se SKU já existe para o usuário:', userId);
+    const existingSkuCheck = await client.query(
+      'SELECT id, sku FROM public.skus WHERE user_id = $1 AND sku = $2',
+      [userId, sku]
+    );
+
+    if (existingSkuCheck.rows.length > 0) {
+      console.log('⚠️ [BACKEND] SKU já existe para este usuário:', existingSkuCheck.rows[0]);
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `O SKU '${sku}' já existe para este usuário.` });
+    }
+
+    console.log('✅ [BACKEND] SKU é único para este usuário, prosseguindo com criação');
 
     const skuInsertQuery = `
       INSERT INTO public.skus
@@ -550,8 +573,12 @@ router.post('/user/:userId/skus', authenticateToken, async (req, res) => {
     ]);
     const newSku = skuResult.rows[0];
 
+    console.log('✅ [BACKEND] SKU/Kit criado com sucesso:', newSku);
+
     if (is_kit && kit_components && kit_components.length > 0) {
       const newKitId = newSku.id;
+      console.log('🔧 [BACKEND] Adicionando componentes ao kit:', kit_components.length);
+      
       const componentInsertQuery = `
         INSERT INTO public.sku_kit_components
         (kit_sku_id, child_sku_id, quantity_per_kit)
@@ -564,16 +591,22 @@ router.post('/user/:userId/skus', authenticateToken, async (req, res) => {
           component.quantity_per_kit
         ]);
       }
+      console.log('✅ [BACKEND] Componentes do kit adicionados com sucesso');
     }
 
     await client.query('COMMIT');
+    console.log('🎉 [BACKEND] Transação confirmada - SKU/Kit criado para usuário:', userId);
     res.status(201).json(newSku);
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('Erro ao criar SKU/Kit:', error);
+    console.error('💥 [BACKEND] Erro ao criar SKU/Kit:', error);
+    
+    // Tratamento específico para constraint única
     if (error.code === '23505') {
-      return res.status(400).json({ error: `O SKU '${sku}' já existe.` });
+      console.log('⚠️ [BACKEND] Violação de constraint única detectada');
+      return res.status(400).json({ error: `O SKU '${sku}' já existe para este usuário.` });
     }
+    
     res.status(500).json({ error: 'Erro interno ao criar SKU. A operação foi cancelada.' });
   } finally {
     client.release();
@@ -1110,14 +1143,24 @@ router.delete('/movements/:movementId', authenticateToken, async (req, res) => {
 
 // --- ROTA PARA CONECTAR SKU A KITS EXISTENTES ---
 router.post('/user/:userId/connect-sku-to-kits', authenticateToken, async (req, res) => {
+  console.log('POST /user/:userId/connect-sku-to-kits called');
+  console.log('Request params:', req.params);
+  console.log('Request body:', req.body);
+  
   const { userId } = req.params;
   const { sku_id, connections } = req.body;
 
+  console.log('Extracted userId:', userId);
+  console.log('Extracted sku_id:', sku_id);
+  console.log('Extracted connections:', connections);
+
   if (req.user.role !== 'master' && req.user.uid !== userId) {
+    console.log('Access denied. User role:', req.user.role, 'User uid:', req.user.uid, 'Requested userId:', userId);
     return res.status(403).json({ error: 'Acesso negado.' });
   }
 
   if (!sku_id || !connections || !Array.isArray(connections) || connections.length === 0) {
+    console.log('Validation failed:', { sku_id, connections, isArray: Array.isArray(connections), length: connections?.length });
     return res.status(400).json({ error: 'SKU ID e conexões são obrigatórios.' });
   }
 
@@ -1126,59 +1169,80 @@ router.post('/user/:userId/connect-sku-to-kits', authenticateToken, async (req, 
     await client.query('BEGIN');
 
     // Verificar se o SKU existe e pertence ao usuário
+    console.log('Checking SKU existence for sku_id:', sku_id, 'userId:', userId);
     const skuCheck = await client.query(
       'SELECT id, sku FROM public.skus WHERE id = $1 AND user_id = $2 AND is_kit = false',
       [sku_id, userId]
     );
     
+    console.log('SKU check result:', skuCheck.rows);
+    
     if (skuCheck.rows.length === 0) {
+      console.log('SKU not found or not individual SKU');
       throw new Error('SKU não encontrado ou não é um SKU individual.');
     }
 
     // Verificar se todos os kits existem e pertencem ao usuário
     for (const connection of connections) {
+      console.log('Checking kit existence for kit_id:', connection.kit_id, 'userId:', userId);
       const kitCheck = await client.query(
         'SELECT id, sku FROM public.skus WHERE id = $1 AND user_id = $2 AND is_kit = true',
         [connection.kit_id, userId]
       );
       
+      console.log('Kit check result for kit_id:', connection.kit_id, ':', kitCheck.rows);
+      
       if (kitCheck.rows.length === 0) {
+        console.log('Kit not found for kit_id:', connection.kit_id);
         throw new Error(`Kit com ID ${connection.kit_id} não encontrado.`);
       }
 
       // Verificar se a conexão já existe
+      console.log('Checking existing connection for kit_id:', connection.kit_id, 'sku_id:', sku_id);
       const existingConnection = await client.query(
         'SELECT id FROM public.sku_kit_components WHERE kit_sku_id = $1 AND child_sku_id = $2',
         [connection.kit_id, sku_id]
       );
 
+      console.log('Existing connection check result:', existingConnection.rows);
+
       if (existingConnection.rows.length > 0) {
         // Atualizar quantidade se já existe
+        console.log('Updating existing connection for kit_id:', connection.kit_id, 'sku_id:', sku_id, 'quantity:', connection.quantity_per_kit);
         await client.query(
           'UPDATE public.sku_kit_components SET quantity_per_kit = $1, updated_at = NOW() WHERE kit_sku_id = $2 AND child_sku_id = $3',
           [connection.quantity_per_kit, connection.kit_id, sku_id]
         );
+        console.log('Connection updated successfully');
       } else {
         // Inserir nova conexão
+        console.log('Inserting new connection for kit_id:', connection.kit_id, 'sku_id:', sku_id, 'quantity:', connection.quantity_per_kit);
         await client.query(
           'INSERT INTO public.sku_kit_components (kit_sku_id, child_sku_id, quantity_per_kit) VALUES ($1, $2, $3)',
           [connection.kit_id, sku_id, connection.quantity_per_kit]
         );
+        console.log('Connection inserted successfully');
       }
     }
 
     await client.query('COMMIT');
+    console.log('Transaction committed successfully');
+    console.log('Sending success response with connections_count:', connections.length);
+    
     res.status(200).json({ 
       message: 'SKU conectado aos kits com sucesso.',
       connections_count: connections.length 
     });
 
   } catch (error) {
+    console.error('Error in connect-sku-to-kits route:', error);
     await client.query('ROLLBACK');
+    console.error('Transaction rolled back');
     console.error('Erro ao conectar SKU aos kits:', error);
     res.status(500).json({ error: error.message || 'Erro interno do servidor.' });
   } finally {
     client.release();
+    console.log('Database client released');
   }
 });
 
