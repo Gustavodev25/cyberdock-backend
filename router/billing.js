@@ -64,10 +64,10 @@ async function calculateAndSaveInvoice(client, uid, period) {
       // Se for o mês de entrada do usuário, calcular proporcional
       if (year === contractStartYear && month === contractStartMonth + 1) {
         const startDay = contractStartDate.getDate();
-        const daysInMonth = new Date(year, month, 0).getDate();
+        const daysInMonth = 30; // Fixo em 30 dias
         const daysRemaining = daysInMonth - startDay + 1;
         
-        // Cálculo: preço base ÷ dias no mês × dias restantes
+        // Cálculo: preço base ÷ 30 dias × dias restantes
         const dailyRate = masterBasePrice / daysInMonth;
         const proportionalPrice = dailyRate * daysRemaining;
         // O cálculo é feito automaticamente com base na data de entrada do cliente

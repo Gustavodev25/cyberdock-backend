@@ -156,10 +156,10 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, as
       if (currentYear === contractStartYear && currentMonth === contractStartMonth) {
         // === USUÁRIO NO PRIMEIRO MÊS - CÁLCULO PROPORCIONAL ===
         const startDay = contractStartDate.getDate();
-        const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+        const daysInMonth = 30; // Fixo em 30 dias
         const daysRemaining = daysInMonth - startDay + 1;
         
-        // Cálculo: 397 ÷ dias no mês × dias restantes
+        // Cálculo: 397 ÷ 30 dias × dias restantes
         const dailyRate = masterBasePrice / daysInMonth;
         baseCost = dailyRate * daysRemaining;
         
@@ -214,7 +214,7 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, as
     const now = new Date();
     const currentYear = now.getUTCFullYear();
     const currentMonth = now.getUTCMonth();
-    const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+    const daysInMonth = 30; // Fixo em 30 dias
     
     // === CÁLCULO DE ARMAZENAMENTO PROPORCIONAL ESPECÍFICO PARA 21/08 ===
     const august21Date = new Date(2024, 7, 21); // 21 de agosto de 2024 (mês 7 = agosto)

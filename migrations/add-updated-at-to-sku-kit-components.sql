@@ -19,3 +19,4 @@ BEGIN
         RAISE NOTICE 'Coluna updated_at já existe na tabela sku_kit_components';
     END IF;
 END $$;
+
