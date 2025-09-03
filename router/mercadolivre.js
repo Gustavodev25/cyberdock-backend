@@ -184,6 +184,165 @@ router.get('/contas/:uid', async (req, res) => {
   }
 });
 
+router.get('/access-token/:mlUserId', authenticateToken, async (req, res) => {
+  const { mlUserId } = req.params;
+  const { uid, role } = req.user;
+
+  if (!mlUserId) {
+    return res.status(400).json({ error: 'ID do usuário ML é obrigatório.' });
+  }
+
+  try {
+    let query, params;
+    
+    if (role === 'master') {
+      query = 'SELECT access_token FROM public.ml_accounts WHERE user_id = $1 AND status = $2';
+      params = [mlUserId, 'active'];
+    } else {
+      query = 'SELECT access_token FROM public.ml_accounts WHERE user_id = $1 AND uid = $2 AND status = $3';
+      params = [mlUserId, uid, 'active'];
+    }
+
+    const { rows } = await db.query(query, params);
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Token de acesso não encontrado ou conta inativa.' });
+    }
+
+    res.json({ access_token: rows[0].access_token });
+  } catch (error) {
+    console.error('Erro ao obter token de acesso:', error);
+    res.status(500).json({ error: 'Erro interno do servidor.' });
+  }
+});
+
+router.get('/download-label', authenticateToken, async (req, res) => {
+    const { shipment_ids, response_type, seller_id } = req.query;
+    const { uid, role } = req.user;
+
+    if (!shipment_ids || !response_type || !seller_id) {
+        return res.status(400).send('Parâmetros shipment_ids, response_type e seller_id são obrigatórios.');
+    }
+
+    try {
+        let accountQuery, accountParams;
+        if (role === 'master') {
+            accountQuery = 'SELECT access_token, refresh_token FROM public.ml_accounts WHERE user_id = $1';
+            accountParams = [seller_id];
+        } else {
+            accountQuery = 'SELECT access_token, refresh_token FROM public.ml_accounts WHERE user_id = $1 AND uid = $2';
+            accountParams = [seller_id, uid];
+        }
+        
+        const { rows } = await db.query(accountQuery, accountParams);
+
+        if (rows.length === 0) {
+            return res.status(404).send('Conta do Mercado Livre não encontrada ou você não tem permissão para acessá-la.');
+        }
+
+        let { access_token: accessToken, refresh_token: refreshToken } = rows[0];
+
+        const fetchLabelWithShipmentId = async (token) => {
+            const mlApiUrl = `https://api.mercadolibre.com/shipment_labels?shipment_ids=${shipment_ids}&response_type=${response_type}`;
+            return await fetch(mlApiUrl, {
+                headers: { 'Authorization': `Bearer ${token}` }
+            });
+        };
+
+        let mlResponse = await fetchLabelWithShipmentId(accessToken);
+
+        if (mlResponse.status === 401 && refreshToken) {
+            console.log(`Token expirado para seller_id: ${seller_id}. Tentando renovar...`);
+            const refreshResponse = await fetch('https://api.mercadolibre.com/oauth/token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                    grant_type: 'refresh_token',
+                    client_id: CLIENT_ID,
+                    client_secret: CLIENT_SECRET,
+                    refresh_token: refreshToken,
+                }),
+            });
+
+            if (refreshResponse.ok) {
+                const newTokenData = await refreshResponse.json();
+                accessToken = newTokenData.access_token;
+                const newRefreshToken = newTokenData.refresh_token;
+
+                await db.query(
+                    "UPDATE public.ml_accounts SET access_token = $1, refresh_token = $2, expires_in = $3, status = 'active', updated_at = NOW() WHERE user_id = $4",
+                    [accessToken, newRefreshToken, newTokenData.expires_in, seller_id]
+                );
+                console.log(`Token renovado com sucesso para seller_id: ${seller_id}`);
+                mlResponse = await fetchLabelWithShipmentId(accessToken);
+            } else {
+                await db.query("UPDATE public.ml_accounts SET status = 'error' WHERE user_id = $1", [seller_id]);
+                return res.status(401).send('Falha ao renovar o token de acesso do Mercado Livre.');
+            }
+        }
+
+        // *** LÓGICA DE FALLBACK APRIMORADA PARA ITENS ENVIADOS ***
+        if (!mlResponse.ok && mlResponse.status === 400) {
+            const errorBodyText = await mlResponse.text();
+            let originalErrorBody = `Erro ao buscar etiqueta do Mercado Livre: ${errorBodyText}`;
+
+            try {
+                const errorBody = JSON.parse(errorBodyText);
+                const isNotPrintable = errorBody?.causes?.includes('NOT_PRINTABLE_STATUS') || errorBody?.message?.includes('status is shipped');
+
+                if (isNotPrintable) {
+                    console.log(`Envio ${shipment_ids} não imprimível. Tentando método alternativo mais direto.`);
+                    
+                    // CORREÇÃO: Usando um endpoint alternativo que usa "/labels" (plural) em vez de "/label" (singular)
+                    const alternativeUrl = `https://api.mercadolibre.com/shipments/${shipment_ids}/labels?response_type=${response_type}`;
+                    console.log(`Tentando buscar etiqueta em: ${alternativeUrl}`);
+                    
+                    const alternativeResponse = await fetch(alternativeUrl, {
+                         headers: { 'Authorization': `Bearer ${accessToken}` }
+                    });
+
+                    if (alternativeResponse.ok) {
+                        console.log(`Sucesso ao buscar etiqueta para o envio ${shipment_ids} pelo método alternativo.`);
+                        const contentType = alternativeResponse.headers.get('content-type');
+                        const contentDisposition = `attachment; filename="etiqueta-${shipment_ids}.${response_type === 'pdf' ? 'pdf' : 'zpl'}"`;
+                        res.setHeader('Content-Type', contentType || 'application/octet-stream');
+                        res.setHeader('Content-Disposition', contentDisposition);
+                        return alternativeResponse.body.pipe(res);
+                    } else {
+                         console.log(`Método alternativo também falhou com status: ${alternativeResponse.status}`);
+                         const altError = await alternativeResponse.text();
+                         originalErrorBody = `Erro ao buscar etiqueta (principal e alternativo): ${altError}`;
+                    }
+                }
+            } catch (e) {
+                 console.error('Não foi possível analisar o corpo do erro ou lidar com a busca alternativa da etiqueta.', e);
+            }
+             // Se o fallback falhar ou não for aplicável, retorna o erro original.
+            return res.status(mlResponse.status).send(originalErrorBody);
+        }
+        // *** FIM DA LÓGICA APRIMORADA ***
+
+
+        if (!mlResponse.ok) {
+            const errorBody = await mlResponse.text();
+            console.error(`Erro ao buscar etiqueta do ML para shipment ${shipment_ids}: ${mlResponse.status} - ${errorBody}`);
+            return res.status(mlResponse.status).send(`Erro ao buscar etiqueta do Mercado Livre: ${errorBody}`);
+        }
+
+        const contentType = mlResponse.headers.get('content-type');
+        const contentDisposition = `attachment; filename="etiqueta-${shipment_ids}.${response_type === 'pdf' ? 'pdf' : 'zpl'}"`;
+
+        res.setHeader('Content-Type', contentType || 'application/octet-stream');
+        res.setHeader('Content-Disposition', contentDisposition);
+        mlResponse.body.pipe(res);
+
+    } catch (error) {
+        console.error('Erro no servidor ao baixar etiqueta:', error);
+        res.status(500).send('Erro interno do servidor ao processar a solicitação da etiqueta.');
+    }
+});
+
+
 router.delete('/contas/:mlUserId', authenticateToken, async (req, res) => {
   const { mlUserId } = req.params;
   const { uid } = req.user;
