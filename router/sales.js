@@ -1181,6 +1181,214 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
   }
 });
 
+// Endpoint para enriquecer vendas existentes com dados de etiquetas
+router.post('/enrich-existing-sales', authenticateToken, async (req, res) => {
+  const { userId, accountNickname: nickname, clientId, clientUid } = req.body;
+  const { uid, role } = req.user;
+  
+  let targetUid = clientUid || uid;
+  
+  try {
+    console.log(`[ENRICH] Iniciando enriquecimento para userId: ${userId}, nickname: ${nickname}, clientUid: ${clientUid}, role: ${role}`);
+    
+    // Busca o token de acesso da conta (mesma lógica do endpoint de sincronização)
+    let access_token, refresh_token;
+    
+    if (role === 'master') {
+      if (clientUid) {
+        const accRes = await db.query(
+          'SELECT access_token, refresh_token FROM public.ml_accounts WHERE user_id = $1 AND uid = $2',
+          [userId, clientUid]
+        );
+        if (accRes.rows.length > 0) {
+          ({ access_token, refresh_token } = accRes.rows[0]);
+        } else {
+          // Fallback: localizar pela conta ML (seller_id) e deduzir o UID do dono
+          const fallback = await db.query(
+            'SELECT access_token, refresh_token, uid FROM public.ml_accounts WHERE user_id = $1 LIMIT 1',
+            [userId]
+          );
+          if (fallback.rows.length > 0) {
+            ({ access_token, refresh_token } = fallback.rows[0]);
+            targetUid = fallback.rows[0].uid;
+          }
+        }
+      } else {
+        // MASTER sem clientUid: localizar pela conta ML (seller_id) e deduzir o UID do dono
+        const accRes = await db.query(
+          'SELECT access_token, refresh_token, uid FROM public.ml_accounts WHERE user_id = $1 LIMIT 1',
+          [userId]
+        );
+        if (accRes.rows.length > 0) {
+          ({ access_token, refresh_token } = accRes.rows[0]);
+          targetUid = accRes.rows[0].uid;
+        }
+      }
+    } else {
+      const accRes = await db.query(
+        'SELECT access_token, refresh_token FROM public.ml_accounts WHERE user_id = $1 AND uid = $2',
+        [userId, targetUid]
+      );
+      if (accRes.rows.length > 0) {
+        ({ access_token, refresh_token } = accRes.rows[0]);
+      }
+    }
+    
+    if (!access_token) {
+      console.log(`[ENRICH] Conta não encontrada para userId: ${userId}, targetUid: ${targetUid}, role: ${role}`);
+      return res.status(404).json({ error: 'Conta não encontrada ou sem permissão.' });
+    }
+    
+    console.log(`[ENRICH] Token encontrado para userId: ${userId}, targetUid: ${targetUid}`);
+    
+    // Busca vendas existentes que precisam ser enriquecidas
+    let salesQuery, salesParams;
+    if (role === 'master') {
+      salesQuery = `
+        SELECT id, raw_api_data 
+        FROM public.sales 
+        WHERE uid = $1 AND seller_id = $2 
+        AND (raw_api_data->'shipping'->>'id' IS NOT NULL)
+        AND (raw_api_data->'shipping'->>'id' != '')
+        ORDER BY sale_date DESC
+        LIMIT 100
+      `;
+      salesParams = [targetUid, userId];
+    } else {
+      salesQuery = `
+        SELECT id, raw_api_data 
+        FROM public.sales 
+        WHERE uid = $1 AND seller_id = $2 
+        AND (raw_api_data->'shipping'->>'id' IS NOT NULL)
+        AND (raw_api_data->'shipping'->>'id' != '')
+        ORDER BY sale_date DESC
+        LIMIT 100
+      `;
+      salesParams = [targetUid, userId];
+    }
+    
+    const salesResult = await db.query(salesQuery, salesParams);
+    const salesToEnrich = salesResult.rows;
+    
+    if (salesToEnrich.length === 0) {
+      return res.json({ 
+        message: 'Nenhuma venda encontrada para enriquecer.',
+        enriched: 0,
+        total: 0
+      });
+    }
+    
+    sendEvent(clientId, { 
+      progress: 10, 
+      message: `[${nickname}] Enriquecendo ${salesToEnrich.length} vendas com dados de etiquetas...`, 
+      type: 'info' 
+    });
+    
+    let enrichedCount = 0;
+    const SLA_CONCURRENCY = 5;
+    
+    // Função para enriquecer uma venda com dados de etiqueta
+    const enrichSale = async (sale, index) => {
+      try {
+        const rawData = sale.raw_api_data;
+        const shipmentId = rawData?.shipping?.id;
+        
+        if (!shipmentId) return sale;
+        
+        // Busca dados do shipment
+        const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}`, { 
+          headers: { Authorization: `Bearer ${access_token}` } 
+        });
+        
+        if (shipmentRes.ok) {
+          const shipmentDetails = await safeJson(shipmentRes);
+          if (shipmentDetails) {
+            rawData.shipping = { ...rawData.shipping, ...shipmentDetails };
+          }
+        }
+        
+        // Busca dados de SLA
+        const slaRes = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/sla`, { 
+          headers: { Authorization: `Bearer ${access_token}` } 
+        });
+        
+        if (slaRes.ok) {
+          const slaData = await safeJson(slaRes);
+          if (slaData) {
+            rawData.sla_data = slaData;
+          }
+        }
+        
+        // Atualiza a venda no banco
+        await db.query(
+          'UPDATE public.sales SET raw_api_data = $1, updated_at = NOW() WHERE id = $2',
+          [JSON.stringify(rawData), sale.id]
+        );
+        
+        enrichedCount++;
+        
+        if (index > 0 && index % 10 === 0) {
+          const pct = 10 + Math.floor(((index + 1) / salesToEnrich.length) * 80);
+          sendEvent(clientId, { 
+            progress: Math.min(90, pct), 
+            message: `[${nickname}] Enriquecendo... ${index + 1}/${salesToEnrich.length}`, 
+            type: 'info' 
+          });
+        }
+        
+        return sale;
+      } catch (e) {
+        console.error(`Falha ao enriquecer venda ${sale.id}:`, e);
+        return sale;
+      }
+    };
+    
+    // Processa as vendas com concorrência limitada
+    const processBatch = async (batch) => {
+      const promises = batch.map((sale, index) => enrichSale(sale, index));
+      return Promise.all(promises);
+    };
+    
+    // Processa em lotes para controlar concorrência
+    for (let i = 0; i < salesToEnrich.length; i += SLA_CONCURRENCY) {
+      const batch = salesToEnrich.slice(i, i + SLA_CONCURRENCY);
+      await processBatch(batch);
+      
+      // Pequena pausa entre lotes para não sobrecarregar a API
+      if (i + SLA_CONCURRENCY < salesToEnrich.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    sendEvent(clientId, { 
+      progress: 100, 
+      message: `[${nickname}] Enriquecimento concluído. ${enrichedCount} vendas atualizadas.`, 
+      type: 'success',
+      enrichedCount: enrichedCount
+    });
+    
+    res.json({ 
+      message: 'Enriquecimento concluído com sucesso.',
+      enriched: enrichedCount,
+      total: salesToEnrich.length
+    });
+    
+  } catch (error) {
+    console.error(`[ENRICH ERROR] Cliente ${clientId} | Conta ${nickname}:`, error);
+    sendEvent(clientId, { 
+      progress: 100, 
+      message: `Erro em [${nickname}]: ${error.message}`, 
+      type: 'error' 
+    });
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (clients[clientId]) {
+      clients[clientId].res.end();
+      delete clients[clientId];
+    }
+  }
+});
+
 // Endpoint para verificar a última sincronização de uma conta
 router.get('/last-sync/:mlAccountId', authenticateToken, async (req, res) => {
   try {
