@@ -288,30 +288,42 @@ router.get('/download-label', authenticateToken, async (req, res) => {
 
             try {
                 const errorBody = JSON.parse(errorBodyText);
-                const isNotPrintable = errorBody?.causes?.includes('NOT_PRINTABLE_STATUS') || errorBody?.message?.includes('status is shipped');
+                const isNotPrintable = errorBody?.causes?.includes('NOT_PRINTABLE_STATUS') || 
+                                     errorBody?.message?.includes('status is shipped') ||
+                                     errorBody?.message?.includes('not printable');
 
                 if (isNotPrintable) {
-                    console.log(`Envio ${shipment_ids} não imprimível. Tentando método alternativo mais direto.`);
+                    console.log(`[1] Envio ${shipment_ids} não imprimível. Tentando método alternativo mais direto.`);
                     
                     // CORREÇÃO: Usando um endpoint alternativo que usa "/labels" (plural) em vez de "/label" (singular)
                     const alternativeUrl = `https://api.mercadolibre.com/shipments/${shipment_ids}/labels?response_type=${response_type}`;
-                    console.log(`Tentando buscar etiqueta em: ${alternativeUrl}`);
+                    console.log(`[1] Tentando buscar etiqueta em: ${alternativeUrl}`);
                     
                     const alternativeResponse = await fetch(alternativeUrl, {
                          headers: { 'Authorization': `Bearer ${accessToken}` }
                     });
 
                     if (alternativeResponse.ok) {
-                        console.log(`Sucesso ao buscar etiqueta para o envio ${shipment_ids} pelo método alternativo.`);
+                        console.log(`[1] Sucesso ao buscar etiqueta para o envio ${shipment_ids} pelo método alternativo.`);
                         const contentType = alternativeResponse.headers.get('content-type');
                         const contentDisposition = `attachment; filename="etiqueta-${shipment_ids}.${response_type === 'pdf' ? 'pdf' : 'zpl'}"`;
                         res.setHeader('Content-Type', contentType || 'application/octet-stream');
                         res.setHeader('Content-Disposition', contentDisposition);
                         return alternativeResponse.body.pipe(res);
                     } else {
-                         console.log(`Método alternativo também falhou com status: ${alternativeResponse.status}`);
+                         console.log(`[1] Método alternativo também falhou com status: ${alternativeResponse.status}`);
                          const altError = await alternativeResponse.text();
-                         originalErrorBody = `Erro ao buscar etiqueta (principal e alternativo): ${altError}`;
+                         
+                         // Se o método alternativo também falhar, retorna uma mensagem mais clara
+                         return res.status(400).json({
+                             error: 'Etiqueta não disponível',
+                             message: `O envio ${shipment_ids} não possui etiqueta disponível para download. Isso pode ocorrer quando o pedido já foi enviado ou cancelado.`,
+                             details: {
+                                 originalError: errorBodyText,
+                                 alternativeError: altError,
+                                 shipmentId: shipment_ids
+                             }
+                         });
                     }
                 }
             } catch (e) {
