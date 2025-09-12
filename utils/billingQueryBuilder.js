@@ -27,8 +27,8 @@ class BillingPeriodCalculator {
         return {
             startDate: period.startDate.toISOString(),
             endDate: period.endDate.toISOString(),
-            startDateLocal: period.startDate.toLocaleDateString('pt-BR'),
-            endDateLocal: period.endDate.toLocaleDateString('pt-BR')
+            startDateLocal: period.startDate.toISOString().split('T')[0],
+            endDateLocal: period.endDate.toISOString().split('T')[0]
         };
     }
     
@@ -106,7 +106,6 @@ class BillingQueryBuilder {
                 uc.service_id,
                 uc.volume,
                 uc.start_date,
-                uc.end_date,
                 s.name as service_name,
                 s.type as service_type,
                 s.price as service_price,
@@ -116,7 +115,7 @@ class BillingQueryBuilder {
                          AND DATE_PART('month', uc.start_date) = $5
                          AND DATE_PART('day', uc.start_date) > 1
                          AND s.type = 'base_storage'
-                    THEN ROUND((s.price / 30.0) * (DATE_PART('day', DATE_TRUNC('month', uc.start_date) + INTERVAL '1 month' - INTERVAL '1 day') - DATE_PART('day', uc.start_date) + 1), 2)
+                    THEN ROUND(CAST((s.price / 30.0) * (DATE_PART('day', DATE_TRUNC('month', uc.start_date) + INTERVAL '1 month' - INTERVAL '1 day') - DATE_PART('day', uc.start_date) + 1) AS NUMERIC), 2)
                     ELSE s.price * COALESCE(uc.volume, 1)
                 END as calculated_price,
                 -- Descrição com detalhes do cálculo
@@ -140,7 +139,6 @@ class BillingQueryBuilder {
             WHERE uc.uid = $1
                 AND s.type IN ('base_storage', 'additional_storage')
                 AND uc.start_date <= $3::date
-                AND (uc.end_date IS NULL OR uc.end_date >= $2::date)
             ORDER BY uc.start_date DESC
         `;
 
