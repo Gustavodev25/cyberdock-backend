@@ -2,8 +2,12 @@
 const express = require('express');
 const db = require('../utils/postgres');
 const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
+const { BillingQueryBuilder } = require('../utils/billingQueryBuilder');
 
 const router = express.Router();
+
+// Instância do construtor de queries corrigidas
+const billingQueryBuilder = new BillingQueryBuilder();
 
 /**
  * Gera/atualiza itens automáticos da fatura (armazenamento + expedições),
@@ -125,23 +129,20 @@ async function calculateAndSaveInvoice(client, uid, period) {
   // O armazenamento base é calculado proporcionalmente baseado na data de entrada do usuário
   // Para meses seguintes, será cobrado o valor completo
 
-  // === 3) Expedições por período ===
-  const shipmentsRes = await client.query(`
-    SELECT sm.quantity_change, pt.name as package_type_name, pt.price as package_type_price
-    FROM public.stock_movements sm
-    JOIN public.skus s ON sm.sku_id = s.id
-    LEFT JOIN public.package_types pt ON s.package_type_id = pt.id
-    WHERE sm.user_id = $1
-      AND sm.movement_type = 'saida'
-      AND sm.reason LIKE 'Saída por Venda%'
-      AND sm.created_at BETWEEN $2 AND $3;
-  `, [uid, startDate, endDate]);
+  // === 3) Expedições por período (QUERY CORRIGIDA) ===
+  console.log(`[BILLING-FIX] Buscando expedições para ${uid}, período ${period}`);
+  
+  // Usar query corrigida que filtra por processed_at ao invés de created_at
+  const salesQuery = billingQueryBuilder.buildSalesQuery(uid, year, month);
+  const shipmentsRes = await client.query(salesQuery.query, salesQuery.params);
+  
+  console.log(`[BILLING-FIX] Encontradas ${shipmentsRes.rows.length} vendas expedidas no período correto`);
 
-  const shipmentSummary = shipmentsRes.rows.reduce((acc, row) => {
-    if (row.package_type_name && row.package_type_price) {
-      const key = row.package_type_name;
-      if (!acc[key]) acc[key] = { quantity: 0, price: parseFloat(row.package_type_price) };
-      acc[key].quantity += row.quantity_change;
+  const shipmentSummary = shipmentsRes.rows.reduce((acc, sale) => {
+    if (sale.package_type_name && sale.package_type_price) {
+      const key = sale.package_type_name;
+      if (!acc[key]) acc[key] = { quantity: 0, price: parseFloat(sale.package_type_price) };
+      acc[key].quantity += parseInt(sale.quantity) || 1;
     }
     return acc;
   }, {});
@@ -384,6 +385,40 @@ router.post('/add-manual-item', authenticateToken, requireMaster, async (req, re
     res.status(500).json({ error: 'Erro ao adicionar item manual.' });
   } finally {
     client.release();
+  }
+});
+
+/** ===== NOVO: debug de cobrança - comparação sistema antigo vs novo ===== */
+router.get('/debug-comparison/:uid', authenticateToken, requireMaster, async (req, res) => {
+  const { uid } = req.params;
+  const period = req.query.period || new Date().toISOString().slice(0, 7);
+  const [year, month] = period.split('-').map(Number);
+
+  try {
+    const comparisonQuery = billingQueryBuilder.buildComparisonQuery(uid, year, month);
+    const { rows } = await db.query(comparisonQuery.query, comparisonQuery.params);
+    
+    const result = {
+      period: comparisonQuery.description,
+      comparison: rows,
+      summary: {
+        old_system: rows.find(r => r.system_type === 'old_system'),
+        new_system: rows.find(r => r.system_type === 'new_system')
+      }
+    };
+    
+    // Calcular diferença
+    if (result.summary.old_system && result.summary.new_system) {
+      result.summary.difference = {
+        items: result.summary.new_system.total_items - result.summary.old_system.total_items,
+        amount: result.summary.new_system.total_amount - result.summary.old_system.total_amount
+      };
+    }
+    
+    res.json(result);
+  } catch (err) {
+    console.error('Erro ao comparar sistemas de cobrança:', err);
+    res.status(500).json({ error: 'Erro ao comparar sistemas de cobrança.' });
   }
 });
 
