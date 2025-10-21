@@ -12,7 +12,7 @@ const router = express.Router();
  * >>> RECOMENDAÇÃO <<<
  * Mova credenciais para variáveis de ambiente.
  */
-const REDIRECT_URI = process.env.ML_REDIRECT_URI || 'https://cyberdock-backend.onrender.com/ml/callback';
+const REDIRECT_URI = process.env.ML_REDIRECT_URI || 'https://cyberdock-backend.onrender.com/api/ml/callback';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:8080';
 const CLIENT_ID = process.env.ML_CLIENT_ID || '8423050287338772';
 const CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'WWYgt9KH0HtZFH4YzD2yhrOLYHCUST9D';
