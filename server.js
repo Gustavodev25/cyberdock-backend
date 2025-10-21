@@ -24,6 +24,10 @@ app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 // Rotas
 app.use('/api', mainRouter);
 
+// Rota alternativa do Mercado Livre sem /api (para compatibilidade com redirect_uri já configurado)
+const mercadoLivreRouter = require('./router/mercadolivre');
+app.use('/ml', mercadoLivreRouter);
+
 // Health opcional
 app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
 
