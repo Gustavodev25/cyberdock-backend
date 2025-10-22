@@ -9,13 +9,25 @@ const { authenticateToken } = require('../utils/authMiddleware');
 const router = express.Router();
 
 /**
- * >>> RECOMENDAÇÃO <<<
- * Mova credenciais para variáveis de ambiente.
+ * >>> CONFIGURAÇÕES DO MERCADO LIVRE <<<
+ * IMPORTANTE: As URLs de redirect devem estar cadastradas no painel de desenvolvedores:
+ * https://developers.mercadolivre.com.br/devcenter
+ *
+ * URLs permitidas (cadastrar TODAS no painel do ML):
+ * - http://localhost:3001/api/ml/callback (desenvolvimento)
+ * - https://cyberdock-backend.onrender.com/api/ml/callback (produção)
+ * - https://SEU-NGROK-URL/api/ml/callback (ngrok - atualizar quando mudar)
  */
 const REDIRECT_URI = process.env.ML_REDIRECT_URI || 'https://cyberdock-backend.onrender.com/api/ml/callback';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:8080';
 const CLIENT_ID = process.env.ML_CLIENT_ID || '8423050287338772';
 const CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'WWYgt9KH0HtZFH4YzD2yhrOLYHCUST9D';
+
+// Lista de URLs de callback permitidas (para validação)
+const ALLOWED_REDIRECT_URIS = [
+  'http://localhost:3001/api/ml/callback',
+  'https://cyberdock-backend.onrender.com/api/ml/callback',
+];
 
 const codeVerifiers = new Map(); // state -> { codeVerifier, createdAt }
 
@@ -72,6 +84,15 @@ router.get('/auth', (req, res) => {
   const finalClientId = client_id || CLIENT_ID;
   const finalRedirectUri = redirect_uri || getRedirectUri();
 
+  // Validar se a URL de redirect está na lista permitida
+  if (!ALLOWED_REDIRECT_URIS.includes(finalRedirectUri)) {
+    console.warn(`[ML Auth] URL de redirect não está na lista permitida: ${finalRedirectUri}`);
+    console.warn('[ML Auth] Certifique-se de que esta URL está cadastrada no painel do Mercado Livre');
+  }
+
+  console.log(`[ML Auth] Iniciando autenticação para UID: ${uid}`);
+  console.log(`[ML Auth] Redirect URI: ${finalRedirectUri}`);
+
   const authUrl =
     'https://auth.mercadolibre.com/authorization' +
     `?response_type=code` +
@@ -103,6 +124,8 @@ router.get('/callback', async (req, res) => {
   codeVerifiers.delete(state);
 
   const redirectUri = getRedirectUri();
+  console.log(`[ML Callback] Processando callback com redirect_uri: ${redirectUri}`);
+
   try {
     const tokenResponse = await fetch('https://api.mercadolibre.com/oauth/token', {
       method: 'POST',
@@ -119,7 +142,20 @@ router.get('/callback', async (req, res) => {
 
     if (!tokenResponse.ok) {
       const errorBody = await tokenResponse.json().catch(() => ({}));
-      throw new Error(errorBody.message || 'Falha ao obter token de acesso.');
+      console.error('[ML Callback] Erro ao obter token:', {
+        status: tokenResponse.status,
+        statusText: tokenResponse.statusText,
+        errorBody,
+        redirectUri,
+      });
+
+      // Mensagem de erro mais detalhada
+      let errorMessage = errorBody.message || 'Falha ao obter token de acesso.';
+      if (tokenResponse.status === 400 && errorBody.error === 'invalid_grant') {
+        errorMessage = 'Erro de autenticação. Verifique se a URL de callback está cadastrada no painel do Mercado Livre.';
+      }
+
+      throw new Error(errorMessage);
     }
 
     const tokenData = await tokenResponse.json();
@@ -582,6 +618,60 @@ router.delete('/contas/:mlUserId', authenticateToken, async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: 'Erro interno ao excluir a conta.' });
   }
+});
+
+/* ----------------------- Verificar configuração --------------------- */
+router.get('/config-check', (req, res) => {
+  const config = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development',
+    redirectUri: REDIRECT_URI,
+    frontendUrl: FRONTEND_URL,
+    clientId: CLIENT_ID,  // Mostrar para debug (remover em produção se necessário)
+    clientIdConfigured: !!CLIENT_ID,
+    clientSecretConfigured: !!CLIENT_SECRET,
+    allowedRedirectUris: ALLOWED_REDIRECT_URIS,
+    warnings: [],
+    instructions: [],
+  };
+
+  // Verificações
+  if (!CLIENT_ID || !CLIENT_SECRET) {
+    config.status = 'error';
+    config.warnings.push('Client ID ou Client Secret não configurados');
+  }
+
+  if (!ALLOWED_REDIRECT_URIS.includes(REDIRECT_URI)) {
+    config.warnings.push(`REDIRECT_URI (${REDIRECT_URI}) não está na lista de URLs permitidas.`);
+    config.instructions.push('Adicione esta URL no painel do Mercado Livre em: https://developers.mercadolivre.com.br/devcenter');
+  }
+
+  // Verificar se está usando localhost em produção
+  if (process.env.NODE_ENV === 'production' && REDIRECT_URI.includes('localhost')) {
+    config.status = 'error';
+    config.warnings.push('URL de callback aponta para localhost em ambiente de produção!');
+  }
+
+  // Instruções para resolver erro 403
+  config.instructions.push('1. Acesse: https://developers.mercadolivre.com.br/devcenter');
+  config.instructions.push('2. Selecione sua aplicação (Client ID: ' + CLIENT_ID + ')');
+  config.instructions.push('3. Vá em "Editar" > "Configurações"');
+  config.instructions.push('4. Em "Redirect URIs", adicione: ' + REDIRECT_URI);
+  config.instructions.push('5. Em "Allowed Domains", adicione: localhost, cyberdock.com.br, cyberdock-backend.onrender.com');
+  config.instructions.push('6. Salve e aguarde alguns minutos');
+
+  res.json(config);
+});
+
+/* ----------------------- Teste de conexão --------------------------- */
+router.get('/test', (req, res) => {
+  res.json({
+    message: 'Mercado Livre router está funcionando!',
+    timestamp: new Date().toISOString(),
+    redirectUri: REDIRECT_URI,
+    environment: process.env.NODE_ENV || 'development',
+  });
 });
 
 module.exports = router;
